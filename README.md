@@ -92,17 +92,15 @@ open ClaudeSessionSync.app
 ```
 Sources/ClaudeSessionSync.swift   Core logic — disk scan, model, winner rule, merge, backup, sync
 Sources/UI.swift                  SwiftUI views — stats, account cards, table, plan/result sheets
-Icon/Claude Sync.icon             Source icon (Apple Icon Composer bundle)
-Icon/make_icon.py                 Composes AppIcon.icns from the source bundle
-Icon/AppIcon.icns                 Generated app icon, embedded by build.sh
-build.sh                          Bundles, icons, and signs ClaudeSessionSync.app
+Icon/AppIcon.icon                 App icon, authored in Apple Icon Composer
+build.sh                          Compiles the icon (actool), bundles, and signs ClaudeSessionSync.app
 ```
 
 The core logic is fully separated from the UI. Everything that reads or writes disk lives in `ClaudeSessionSync.swift`; `UI.swift` only presents it.
 
 ### App icon
 
-The icon is a dark rounded tile with the white sync glyph. `build.sh` embeds `Icon/AppIcon.icns`; if it is missing it is regenerated from the source `Icon/Claude Sync.icon` bundle by `Icon/make_icon.py` (requires Python + Pillow). Editing the artwork means editing the `.icon` bundle and deleting `Icon/AppIcon.icns` so the next build regenerates it.
+The icon is authored in **Apple Icon Composer** and lives at `Icon/AppIcon.icon`. At build time `build.sh` runs `actool` — Apple's own asset compiler — to render it into `Assets.car` (the Liquid Glass icon macOS 26 draws natively) plus a flat `AppIcon.icns` fallback for older systems. The icon is never hand-converted; to change it, edit the `.icon` bundle in Icon Composer and rebuild.
 
 ---
 

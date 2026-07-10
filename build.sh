@@ -1,11 +1,24 @@
 #!/bin/zsh
-# Compila ClaudeSessionSync.app — nessuna dipendenza oltre alla toolchain Swift di Xcode.
+# Build ClaudeSessionSync.app — no dependency beyond Xcode's Swift toolchain + actool.
 set -e
 cd "$(dirname "$0")"
 
 APP="ClaudeSessionSync.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# --- App icon --------------------------------------------------------------
+# The icon is authored in Apple Icon Composer (Icon/AppIcon.icon). actool — Apple's own
+# asset compiler — renders it into Assets.car (the Liquid Glass icon macOS 26 draws) plus a
+# flat AppIcon.icns fallback for older systems. We do NOT hand-convert it.
+ICON_OUT="$(mktemp -d)"
+xcrun actool "$PWD/Icon/AppIcon.icon" \
+  --compile "$ICON_OUT" \
+  --platform macosx \
+  --minimum-deployment-target 26.0 \
+  --app-icon AppIcon \
+  --output-partial-info-plist "$ICON_OUT/partial.plist" >/dev/null
+cp "$ICON_OUT/Assets.car" "$ICON_OUT/AppIcon.icns" "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -15,6 +28,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Claude Session Sync</string>
   <key>CFBundleExecutable</key><string>ClaudeSessionSync</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>enterprise.lavder.claude-session-sync</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -25,19 +39,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-# App icon. Regenerate from the source .icon bundle if the .icns is missing.
-if [ ! -f Icon/AppIcon.icns ]; then
-  echo "AppIcon.icns not found — generating from Icon/Claude Sync.icon"
-  python3 Icon/make_icon.py
-fi
-cp Icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-
+# --- Executable ------------------------------------------------------------
 swiftc -O -parse-as-library \
   -target arm64-apple-macosx14.0 \
   -o "$APP/Contents/MacOS/ClaudeSessionSync" \
   Sources/ClaudeSessionSync.swift Sources/UI.swift
 
-# Firma ad-hoc: senza, macOS uccide l'app al lancio su Apple Silicon.
+# Ad-hoc signature: without one, macOS kills the app on launch on Apple Silicon.
 codesign --force --sign - "$APP" 2>/dev/null
 
+rm -rf "$ICON_OUT"
 echo "Build ok → $(pwd)/$APP"
