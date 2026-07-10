@@ -1,0 +1,10 @@
+# Build output
+ClaudeSessionSync.app/
+*.dSYM/
+.build/
+
+# macOS
+.DS_Store
+
+# Backups produced by the tool itself (never inside the repo, but just in case)
+claude-code-sessions.backup-*/
