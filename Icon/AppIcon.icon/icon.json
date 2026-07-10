@@ -9,9 +9,8 @@
           "fill" : {
             "solid" : "display-p3:0.06744,0.06781,0.07489,1.00000"
           },
-          "glass" : true,
-          "image-name" : "Progetto senza titolo (1).png",
-          "name" : "Progetto senza titolo (1)",
+          "image-name" : "claude-sync.png",
+          "name" : "claude-sync",
           "position" : {
             "scale" : 0.4,
             "translation-in-points" : [
