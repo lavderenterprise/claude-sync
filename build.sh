@@ -14,6 +14,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Claude Session Sync</string>
   <key>CFBundleDisplayName</key><string>Claude Session Sync</string>
   <key>CFBundleExecutable</key><string>ClaudeSessionSync</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>enterprise.lavder.claude-session-sync</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -23,6 +24,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSHumanReadableCopyright</key><string>Lavder Enterprise</string>
 </dict></plist>
 PLIST
+
+# App icon. Regenerate from the source .icon bundle if the .icns is missing.
+if [ ! -f Icon/AppIcon.icns ]; then
+  echo "AppIcon.icns not found — generating from Icon/Claude Sync.icon"
+  python3 Icon/make_icon.py
+fi
+cp Icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 swiftc -O -parse-as-library \
   -target arm64-apple-macosx14.0 \
