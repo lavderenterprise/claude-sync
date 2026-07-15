@@ -216,23 +216,42 @@ struct CodexContent: View {
     @ViewBuilder private func actionButton(_ r: PairRow) -> some View {
         switch r.state {
         case .pendingToCodex, .pendingToClaude:
-            Button("Sync") { store.syncRow(r) }
-                .controlSize(.small).disabled(store.busy)
+            pillButton("Sync", icon: "arrow.left.arrow.right", tint: .accentColor,
+                       prominent: false) { store.syncRow(r) }
+                .disabled(store.busy)
         case .unlinkedClaude:
-            Button("→ Codex") { store.syncRow(r) }
-                .controlSize(.small).disabled(store.busy || store.schemaDrifted)
+            pillButton("Codex", icon: "arrow.right.circle.fill", tint: .accentColor,
+                       prominent: false) { store.syncRow(r) }
+                .disabled(store.busy || store.schemaDrifted)
                 .help("Import this Claude session as a Codex thread")
         case .unlinkedCodex:
-            Button("→ Claude") { store.syncRow(r) }
-                .controlSize(.small).disabled(store.busy)
+            pillButton("Claude", icon: "arrow.left.circle.fill", tint: .accentColor,
+                       prominent: false) { store.syncRow(r) }
+                .disabled(store.busy)
                 .help("Import this Codex thread as a Claude session")
         case .conflict:
-            Button("Resolve…") { route = .resolve(r) }
-                .controlSize(.small).disabled(store.busy)
+            pillButton("Resolve", icon: "arrow.triangle.branch", tint: .orange,
+                       prominent: true) { route = .resolve(r) }
+                .disabled(store.busy)
                 .help("Choose which side wins")
         case .synced:
-            Text("—").font(.system(size: 10.5)).foregroundStyle(.quaternary)
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 11)).foregroundStyle(.quaternary)
         }
+    }
+
+    private func pillButton(_ title: String, icon: String, tint: Color,
+                            prominent: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 9.5, weight: .semibold))
+                Text(title).font(.system(size: 10.5, weight: .semibold))
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(prominent ? tint : tint.opacity(0.85))
+        .controlSize(.small)
+        .buttonBorderShape(.capsule)
     }
 
     @ViewBuilder private func stateLabel(_ r: PairRow) -> some View {

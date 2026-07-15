@@ -42,6 +42,8 @@ final class CodexEngine {
         let codexById = Dictionary(uniqueKeysWithValues:
             CodexIO.enumerateThreads().map { ($0.id, $0) })
 
+        if healRolloutPaths(&store, codexById: codexById) { try? LinkStoreIO.save(store) }
+
         let fm = FileManager.default
         var rows: [PairRow] = []
         var dirty = false
@@ -96,6 +98,25 @@ final class CodexEngine {
             max($1.claudeLastActivity, $1.codexLastActivity)
         }
         return result
+    }
+
+    /// Codex MOVES a rollout when its thread is archived (sessions/… →
+    /// archived_sessions/…) and records the new location in the threads row. Follow the
+    /// move instead of reporting a phantom "rollout missing" conflict.
+    func healRolloutPaths(_ store: inout LinkStoreFile,
+                          codexById: [String: CodexThreadInfo]) -> Bool {
+        let fm = FileManager.default
+        var dirty = false
+        for i in store.pairs.indices {
+            let rec = store.pairs[i]
+            guard !fm.fileExists(atPath: rec.codexRolloutPath),
+                  let t = codexById[rec.codexThreadId],
+                  t.rolloutPath != rec.codexRolloutPath,
+                  fm.fileExists(atPath: t.rolloutPath) else { continue }
+            store.pairs[i].codexRolloutPath = t.rolloutPath
+            dirty = true
+        }
+        return dirty
     }
 
     /// Cursor-vs-size state machine. Shrunk file = rewritten history (compaction etc.):
@@ -415,6 +436,9 @@ extension CodexEngine {
         do {
             var store = try LinkStoreIO.load()
             if recover(&store) { try LinkStoreIO.save(store) }
+            let codexById = Dictionary(uniqueKeysWithValues:
+                CodexIO.enumerateThreads().map { ($0.id, $0) })
+            if healRolloutPaths(&store, codexById: codexById) { try LinkStoreIO.save(store) }
 
             report.backupDir = try BackupManager.runBackup()
 
