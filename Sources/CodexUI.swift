@@ -237,6 +237,9 @@ struct CodexContent: View {
         case .synced:
             Image(systemName: "checkmark.circle")
                 .font(.system(size: 11)).foregroundStyle(.quaternary)
+        case .working:
+            Image(systemName: "hourglass")
+                .font(.system(size: 11)).foregroundStyle(.tertiary)
         }
     }
 
@@ -272,6 +275,10 @@ struct CodexContent: View {
         case .unlinkedClaude, .unlinkedCodex:
             Label("unlinked", systemImage: "link.badge.plus")
                 .font(.system(size: 10.5)).foregroundStyle(.secondary)
+        case .working:
+            Label("working…", systemImage: "ellipsis.circle")
+                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                .help("The agent is still writing — it will become syncable once the reply settles")
         }
     }
 

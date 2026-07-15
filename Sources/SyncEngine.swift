@@ -53,10 +53,30 @@ final class CodexEngine {
             let claude = claudeById[rec.claudeSessionId]
             let codex = codexById[rec.codexThreadId]
 
-            let claudeSize = (try? fm.attributesOfItem(atPath: rec.claudeTranscriptPath))?[.size] as? Int64
-            let codexSize = (try? fm.attributesOfItem(atPath: rec.codexRolloutPath))?[.size] as? Int64
+            let claudeAttrs = try? fm.attributesOfItem(atPath: rec.claudeTranscriptPath)
+            let codexAttrs = try? fm.attributesOfItem(atPath: rec.codexRolloutPath)
+            let claudeSize = claudeAttrs?[.size] as? Int64
+            let codexSize = codexAttrs?[.size] as? Int64
 
-            let (state, reason) = pairState(rec: rec, claudeSize: claudeSize, codexSize: codexSize)
+            var (state, reason) = pairState(rec: rec, claudeSize: claudeSize, codexSize: codexSize)
+
+            // A freshly-written grown side means the agent is still mid-turn: showing
+            // "to sync" (or judging a conflict) now would be premature — the same quiet
+            // window the auto-sync debouncer uses decides when it's really settled.
+            if state == .pendingToCodex || state == .pendingToClaude || state == .conflict {
+                let quiet = max(5, UserDefaults.standard.double(forKey: "quiescenceSeconds")
+                                   .isZero ? 20 : UserDefaults.standard.double(forKey: "quiescenceSeconds"))
+                func isHot(_ attrs: [FileAttributeKey: Any]?) -> Bool {
+                    guard let m = attrs?[.modificationDate] as? Date else { return false }
+                    return Date().timeIntervalSince(m) < quiet
+                }
+                let claudeGrew = (claudeSize ?? 0) > rec.claude.byteOffset
+                let codexGrew = (codexSize ?? 0) > rec.codex.byteOffset
+                if (claudeGrew && isHot(claudeAttrs)) || (codexGrew && isHot(codexAttrs)) {
+                    state = .working
+                    reason = nil
+                }
+            }
             if state.rawValue != rec.state || reason != rec.conflictReason {
                 rec.state = state.rawValue
                 rec.conflictReason = reason

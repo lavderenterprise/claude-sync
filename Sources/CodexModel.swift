@@ -4,6 +4,8 @@ import Foundation
 
 enum PairState: String, Codable {
     case synced, pendingToCodex, pendingToClaude, conflict, unlinkedClaude, unlinkedCodex
+    case working      // a side grew but is still being written (agent mid-turn):
+                      // not pending yet, not counted in the badge, no action offered
 }
 
 enum SyncDirection { case toCodex, toClaude }
