@@ -279,7 +279,7 @@ enum CodexWriter {
     static func topUpWorkspaceHints() {
         guard !CodexIO.codexIsRunning() else { return }
         let gs = CodexPaths.home.appending(path: ".codex-global-state.json")
-        guard var d = readJSON(gs) else { return }
+        guard let d = readJSON(gs) else { return }
         var hints = (d["thread-workspace-root-hints"] as? [String: String]) ?? [:]
         let before = hints.count
         for t in CodexIO.enumerateThreads() where hints[t.id] == nil && t.cwd != "—" {
