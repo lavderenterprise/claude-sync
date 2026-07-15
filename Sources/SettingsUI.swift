@@ -41,14 +41,9 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 section("Automation") {
-                    Toggle(isOn: $autoSyncEnabled) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Auto-sync").font(.system(size: 12.5, weight: .medium))
-                            Text("When a chat finishes receiving a reply in one app, mirror it to the other automatically.")
-                                .font(.system(size: 10.5)).foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
+                    settingRow("Auto-sync",
+                               "When a chat finishes receiving a reply in one app, mirror it to the other automatically.",
+                               isOn: $autoSyncEnabled)
 
                     HStack(spacing: 10) {
                         Text("Quiet period").font(.system(size: 11.5))
@@ -69,26 +64,16 @@ struct SettingsView: View {
                 }
 
                 section("Menu bar") {
-                    Toggle(isOn: $showMenuBarExtra) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Show in menu bar").font(.system(size: 12.5, weight: .medium))
-                            Text("Quick sync and a badge with the number of chats waiting to sync.")
-                                .font(.system(size: 10.5)).foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
+                    settingRow("Show in menu bar",
+                               "Quick sync and a badge with the number of chats waiting to sync.",
+                               isOn: $showMenuBarExtra)
                 }
 
                 section("System") {
-                    Toggle(isOn: Binding(get: { loginItem.enabled },
-                                         set: { loginItem.toggle($0) })) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Launch at login").font(.system(size: 12.5, weight: .medium))
-                            Text("Keeps the widget and auto-sync available after a restart.")
-                                .font(.system(size: 10.5)).foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
+                    settingRow("Launch at login",
+                               "Keeps the widget and auto-sync available after a restart.",
+                               isOn: Binding(get: { loginItem.enabled },
+                                             set: { loginItem.toggle($0) }))
 
                     if loginItem.needsApproval {
                         HStack(spacing: 8) {
@@ -121,6 +106,20 @@ struct SettingsView: View {
         .onChange(of: autoSyncEnabled) { _, _ in app.settingsChanged() }
         .onChange(of: quiescenceSeconds) { _, _ in app.settingsChanged() }
         .onChange(of: showMenuBarExtra) { _, _ in app.settingsChanged() }
+    }
+
+    /// Label + description on the left, switch pinned to the card's right edge.
+    private func settingRow(_ title: String, _ subtitle: String,
+                            isOn: Binding<Bool>) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 12.5, weight: .medium))
+                Text(subtitle).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 16)
+            Toggle("", isOn: isOn).toggleStyle(.switch).labelsHidden()
+        }
     }
 
     @ViewBuilder private func section(_ title: String,

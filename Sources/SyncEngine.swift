@@ -402,10 +402,7 @@ extension CodexEngine {
                                                     createdAtMs: s.createdAt)
         let rolloutURL = CodexWriter.rolloutPath(threadId: codexId, createdAtMs: s.createdAt)
 
-        let toolResults = try ClaudeToCodexEmitter.collectToolResults(path: s.transcriptPath, from: 0)
-        let emitter = ClaudeToCodexEmitter(codexId: codexId, cwd: s.cwd,
-                                           turnTemplate: templates.turn,
-                                           toolResults: toolResults, startTurnIndex: 0)
+        let emitter = ClaudeToCodexEmitter(codexId: codexId, cwd: s.cwd, startTurnIndex: 0)
         let createdISO = ISO8601DateFormatter()
             .string(from: Date(timeIntervalSince1970: Double(s.createdAt) / 1000))
 
@@ -549,14 +546,10 @@ extension CodexEngine {
     func incrementalToCodex(at idx: Int, store: inout LinkStoreFile,
                             report: inout CodexSyncReport) throws {
         try guardCodexWritable()
-        guard let templates = CodexTemplates.load() else { throw EngineError.codexHasNoTemplate }
+        guard CodexTemplates.load() != nil else { throw EngineError.codexHasNoTemplate }
         var rec = store.pairs[idx]
 
-        let toolResults = try ClaudeToCodexEmitter.collectToolResults(
-            path: rec.claudeTranscriptPath, from: rec.claude.byteOffset)
         let emitter = ClaudeToCodexEmitter(codexId: rec.codexThreadId, cwd: rec.cwd,
-                                           turnTemplate: templates.turn,
-                                           toolResults: toolResults,
                                            startTurnIndex: rec.codexTurnIndex)
         var lines: [[String: Any]] = []
         let consumed = try ClaudeIO.streamLines(path: rec.claudeTranscriptPath,

@@ -50,25 +50,48 @@ enum DeterministicID {
 
 // MARK: - Text renderers (tool traffic crosses formats as inert readable text)
 
-private let toolPayloadCap = 4096
+// Rendering replicates OpenAI's own /import (codex-rs/external-agent-migration,
+// sessions/records.rs): bounded [external_agent_tool_call]/[external_agent_tool_result]
+// tags with key fields extracted, 2000/4000-char caps, unsupported blocks made visible.
+private let noteMaxLen = 2000
+private let toolResultMaxLen = 4000
+
+private func truncated(_ s: String, _ cap: Int) -> String {
+    s.count > cap ? String(s.prefix(cap)) : s
+}
 
 func renderToolUse(name: String, input: Any?) -> String {
-    var body = ""
-    if let input, JSONSerialization.isValidJSONObject(input),
-       let data = try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys]),
-       let s = String(data: data, encoding: .utf8) {
-        body = s
-    } else if let s = input as? String {
-        body = s
+    var lines = ["[external_agent_tool_call: \(name)]"]
+    if let dict = input as? [String: Any] {
+        if let d = dict["description"] as? String { lines.append("description: \(d)") }
+        if let c = dict["command"] as? String { lines.append("command: \(c)") }
+        if let f = (dict["file_path"] as? String) ?? (dict["file"] as? String) {
+            lines.append("file: \(f)")
+        }
+        if lines.count == 1,
+           let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            lines.append("input: \(truncated(json, noteMaxLen))")
+        }
+    } else if let s = input as? String, !s.isEmpty {
+        lines.append("input: \(truncated(s, noteMaxLen))")
     }
-    if body.count > toolPayloadCap { body = String(body.prefix(toolPayloadCap)) + "\n… (truncated)" }
-    return "⏺ Tool: \(name)" + (body.isEmpty ? "" : "\n" + body)
+    lines.append("[/external_agent_tool_call]")
+    return lines.joined(separator: "\n")
 }
 
 func renderToolResult(_ text: String, isError: Bool) -> String {
-    var t = text
-    if t.count > toolPayloadCap { t = String(t.prefix(toolPayloadCap)) + "… (truncated)" }
-    return "  ⎿ " + (isError ? "(error) " : "") + t
+    let label = isError ? "[external_agent_tool_result: error]" : "[external_agent_tool_result]"
+    if text.isEmpty { return label + "\n[/external_agent_tool_result]" }
+    return label + "\n" + truncated(text, toolResultMaxLen) + "\n[/external_agent_tool_result]"
+}
+
+func epochSeconds(_ iso: String) -> Int? {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f.date(from: iso) { return Int(d.timeIntervalSince1970) }
+    f.formatOptions = [.withInternetDateTime]
+    return f.date(from: iso).map { Int($0.timeIntervalSince1970) }
 }
 
 /// Flattens heterogeneous content (string | [{type:text,…}]) to plain text.
@@ -84,10 +107,10 @@ func flattenContent(_ content: Any?) -> String {
 
 // MARK: - Claude → Codex (incremental emitter; scales to arbitrarily large regions)
 
-/// Feed Claude lines one at a time; rollout lines come out. Two-phase by design:
-/// callers first stream the region once through `collectToolResults`, then stream it
-/// again through `feed` — tool results arrive as *user* lines and must be attached to
-/// the assistant blocks that invoked them.
+/// Feed Claude lines one at a time; rollout lines come out. The structure replicates
+/// OpenAI's native importer (sessions/export.rs) exactly: no per-turn turn_context,
+/// readable turn ids, tool traffic inline as bounded tags, tool-result-only user lines
+/// demoted to assistant continuations, and an import marker + token estimate at the end.
 final class ClaudeToCodexEmitter {
     struct Stats {
         var lastConsumedUuid: String?
@@ -100,36 +123,17 @@ final class ClaudeToCodexEmitter {
 
     private let codexId: String
     private let cwd: String
-    private let turnTemplate: [String: Any]
-    private let toolResults: [String: String]
     private var turnIndex: Int
     private var currentTurnId: String?
-    private var lastAgentText = ""
+    private var currentTurnStartedAt: Int?      // epoch seconds
+    private var responseBytes = 0
+    private var lastTimestampSecs: Int?
     private(set) var stats = Stats()
 
-    init(codexId: String, cwd: String, turnTemplate: [String: Any],
-         toolResults: [String: String], startTurnIndex: Int) {
+    init(codexId: String, cwd: String, startTurnIndex: Int) {
         self.codexId = codexId
         self.cwd = cwd
-        self.turnTemplate = turnTemplate
-        self.toolResults = toolResults
         self.turnIndex = startTurnIndex
-    }
-
-    static func collectToolResults(path: String, from offset: Int64) throws -> [String: String] {
-        var out: [String: String] = [:]
-        _ = try streamJSONL(path: path, from: offset) { dict in
-            guard (dict["type"] as? String) == "user",
-                  (dict["isSidechain"] as? Bool) != true,
-                  let message = dict["message"] as? [String: Any],
-                  let items = message["content"] as? [[String: Any]] else { return }
-            for item in items where (item["type"] as? String) == "tool_result" {
-                guard let id = item["tool_use_id"] as? String else { continue }
-                let isErr = (item["is_error"] as? Bool) ?? false
-                out[id] = renderToolResult(flattenContent(item["content"]), isError: isErr)
-            }
-        }
-        return out
     }
 
     static func preamble(metaTemplate: [String: Any], codexId: String, cwd: String,
@@ -147,102 +151,131 @@ final class ClaudeToCodexEmitter {
         if let u = line.uuid { stats.lastConsumedUuid = u }
         let ts = line.timestamp ?? isoNow()
         stats.lastTimestamp = ts
+        let tsSecs = epochSeconds(ts)
+        if tsSecs != nil { lastTimestampSecs = tsSecs }
 
-        guard !line.isSidechain else { return [] }
-
-        switch line.type {
-        case "user":
-            guard !line.isMeta,
-                  (line.raw["isCompactSummary"] as? Bool) != true,
-                  (line.raw["isVisibleInTranscriptOnly"] as? Bool) != true else { return [] }
-            let content = line.message?["content"]
-            var text = ""
-            if let s = content as? String {
-                text = s
-            } else if let items = content as? [[String: Any]] {
-                // Tool-result-only user lines are plumbing, not a user turn.
-                let texts = items.filter { ($0["type"] as? String) == "text" }
-                guard !texts.isEmpty else { return [] }
-                text = texts.compactMap { $0["text"] as? String }.joined(separator: "\n")
+        guard !line.isSidechain, !line.isMeta,
+              line.type == "user" || line.type == "assistant" else {
+            if line.type != "user", line.type != "assistant",
+               !["system", "attachment", "queue-operation", "last-prompt", "mode",
+                 "pr-link", "ai-title", "custom-title", "file", "summary"].contains(line.type) {
+                stats.skippedUnknown += 1
             }
-            guard !text.isEmpty else { return [] }
+            return []
+        }
 
-            var out = closeTurn(at: ts)
+        // Extract text exactly like the native importer: text blocks verbatim, tool_use
+        // and tool_result as bounded tags IN PLACE, thinking dropped, unknown made visible.
+        guard let extracted = extractText(line.message?["content"]) else { return [] }
+
+        // A user line that is only tool results is the tail of the agent's work,
+        // not a user turn — the native importer demotes it to an assistant message.
+        let role = (line.type == "assistant" || extracted.onlyToolResult) ? "assistant" : "user"
+
+        if role == "user" {
+            var out = closeTurn(completedAt: nil)
             turnIndex += 1
-            let tid = DeterministicID.turnId(codexId: codexId, index: turnIndex)
+            let tid = "external-import-turn-\(turnIndex)"
             currentTurnId = tid
-            if stats.firstUserText == nil { stats.firstUserText = text }
+            currentTurnStartedAt = tsSecs
+            if stats.firstUserText == nil { stats.firstUserText = extracted.text }
             stats.turnsEmitted += 1
+            responseBytes += extracted.text.utf8.count
 
-            var turn = turnTemplate
-            turn["turn_id"] = tid
-            turn["cwd"] = cwd
-            turn["workspace_roots"] = [cwd]
-            if var sp = turn["sandbox_policy"] as? [String: Any], sp["writable_roots"] != nil {
-                sp["writable_roots"] = [cwd]
-                turn["sandbox_policy"] = sp
-            }
-            out.append(["timestamp": ts, "type": "turn_context", "payload": turn])
             out.append(["timestamp": ts, "type": "event_msg",
-                        "payload": ["type": "task_started", "turn_id": tid]])
+                        "payload": ["type": "task_started", "turn_id": tid,
+                                    "started_at": tsSecs as Any? ?? NSNull()]])
             out.append(["timestamp": ts, "type": "event_msg",
-                        "payload": ["type": "user_message", "message": text,
+                        "payload": ["type": "user_message", "message": extracted.text,
                                     "images": [], "local_images": [], "text_elements": []]])
             out.append(["timestamp": ts, "type": "response_item",
                         "payload": ["type": "message", "role": "user",
-                                    "content": [["type": "input_text", "text": text]]]])
+                                    "content": [["type": "input_text", "text": extracted.text]]]])
             return out
-
-        case "assistant":
-            guard let items = line.message?["content"] as? [[String: Any]] else { return [] }
-            var blocks: [String] = []
-            for item in items {
-                switch item["type"] as? String {
-                case "text":
-                    if let t = item["text"] as? String, !t.isEmpty { blocks.append(t) }
-                case "tool_use":
-                    let name = (item["name"] as? String) ?? "?"
-                    blocks.append(renderToolUse(name: name, input: item["input"]))
-                    if let id = item["id"] as? String, let res = toolResults[id] {
-                        blocks.append(res)
-                    }
-                default:
-                    break                           // thinking, fallback, unknown → skipped
-                }
-            }
-            guard !blocks.isEmpty else { return [] }
-            let text = blocks.joined(separator: "\n\n")
-            lastAgentText = text
-            return [
-                ["timestamp": ts, "type": "response_item",
-                 "payload": ["type": "message", "role": "assistant",
-                             "content": [["type": "output_text", "text": text]]]],
-                ["timestamp": ts, "type": "event_msg",
-                 "payload": ["type": "agent_message", "message": text]],
-            ]
-
-        case "system", "attachment", "queue-operation", "last-prompt", "mode",
-             "pr-link", "ai-title", "custom-title", "file":
-            return []                               // known non-conversation lines
-
-        default:
-            stats.skippedUnknown += 1               // schema drift: visible, never fatal
-            return []
         }
+
+        // Assistant content before any user turn is dropped (native behavior).
+        guard currentTurnId != nil else { return [] }
+        responseBytes += extracted.text.utf8.count
+        return [
+            ["timestamp": ts, "type": "event_msg",
+             "payload": ["type": "agent_message", "message": extracted.text]],
+            ["timestamp": ts, "type": "response_item",
+             "payload": ["type": "message", "role": "assistant",
+                         "content": [["type": "output_text", "text": extracted.text]]]],
+        ]
     }
 
+    /// Import marker + estimated token count + final task_complete — the native footer.
     func finish() -> [[String: Any]] {
-        closeTurn(at: stats.lastTimestamp.isEmpty ? isoNow() : stats.lastTimestamp)
+        guard currentTurnId != nil else { return [] }
+        let ts = stats.lastTimestamp.isEmpty ? isoNow() : stats.lastTimestamp
+        var out: [[String: Any]] = [
+            ["timestamp": ts, "type": "event_msg",
+             "payload": ["type": "agent_message", "message": "<EXTERNAL SESSION IMPORTED>"]],
+        ]
+        let tokens = responseBytes / 4                    // native byte→token approximation
+        let usage: [String: Any] = ["total_tokens": tokens, "input_tokens": 0, "output_tokens": 0,
+                                    "cached_input_tokens": 0, "reasoning_output_tokens": 0]
+        out.append(["timestamp": ts, "type": "event_msg",
+                    "payload": ["type": "token_count",
+                                "info": ["total_token_usage": usage, "last_token_usage": usage,
+                                         "model_context_window": NSNull()],
+                                "rate_limits": NSNull()]])
+        out.append(contentsOf: closeTurn(completedAt: lastTimestampSecs))
+        return out
     }
 
-    private func closeTurn(at ts: String) -> [[String: Any]] {
+    private func closeTurn(completedAt: Int?) -> [[String: Any]] {
         guard let tid = currentTurnId else { return [] }
         currentTurnId = nil
-        let text = lastAgentText
-        lastAgentText = ""
+        let ts = stats.lastTimestamp.isEmpty ? isoNow() : stats.lastTimestamp
         return [["timestamp": ts, "type": "event_msg",
                  "payload": ["type": "task_complete", "turn_id": tid,
-                             "last_agent_message": text]]]
+                             "last_agent_message": NSNull(),
+                             "started_at": currentTurnStartedAt as Any? ?? NSNull(),
+                             "completed_at": completedAt as Any? ?? NSNull()]]]
+    }
+
+    private struct Extracted {
+        let text: String
+        let onlyToolResult: Bool
+    }
+
+    /// Mirror of the native extract_message_text: string content verbatim; array content
+    /// block-by-block with tags; blank result → nil.
+    private func extractText(_ content: Any?) -> Extracted? {
+        if let s = content as? String {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : Extracted(text: s, onlyToolResult: false)
+        }
+        guard let items = content as? [[String: Any]] else { return nil }
+        var parts: [String] = []
+        var onlyToolResult = !items.isEmpty
+        for block in items {
+            switch block["type"] as? String {
+            case "text":
+                if let t = block["text"] as? String, !t.isEmpty {
+                    parts.append(t)
+                    onlyToolResult = false
+                }
+            case "tool_use":
+                parts.append(renderToolUse(name: (block["name"] as? String) ?? "unknown",
+                                           input: block["input"]))
+                onlyToolResult = false
+            case "tool_result":
+                let isErr = (block["is_error"] as? Bool) ?? false
+                parts.append(renderToolResult(flattenContent(block["content"]), isError: isErr))
+            case "thinking", .none:
+                break
+            case .some(let other):
+                parts.append("[external unsupported block: \(other)]")
+                onlyToolResult = false
+            }
+        }
+        let text = parts.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .joined(separator: "\n\n")
+        return text.isEmpty ? nil : Extracted(text: text, onlyToolResult: onlyToolResult)
     }
 
     var nextTurnIndex: Int { turnIndex }

@@ -123,8 +123,19 @@ final class SQLiteDB {
     }
 }
 
-/// The only safe way to copy a live WAL database another process holds open.
+/// Copy a live WAL database another process holds open. VACUUM INTO takes a plain
+/// read snapshot and writes a compact copy — sturdier against busy WAL churn than
+/// the backup API, which stays as fallback.
 func sqliteOnlineBackup(from src: String, to dst: String) throws {
+    try? FileManager.default.removeItem(atPath: dst)      // VACUUM INTO refuses existing files
+    if let db = try? SQLiteDB(path: src, readOnly: true) {
+        let escaped = dst.replacingOccurrences(of: "'", with: "''")
+        if (try? db.run("VACUUM INTO '\(escaped)'")) != nil { return }
+    }
+    try sqliteBackupAPI(from: src, to: dst)
+}
+
+private func sqliteBackupAPI(from src: String, to dst: String) throws {
     var srcDB: OpaquePointer?
     var dstDB: OpaquePointer?
     defer { sqlite3_close(srcDB); sqlite3_close(dstDB) }

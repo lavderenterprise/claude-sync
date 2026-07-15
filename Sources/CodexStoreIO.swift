@@ -137,27 +137,27 @@ enum CodexIO {
 struct CodexTemplates {
     let meta: [String: Any]           // session_meta payload (base_instructions included —
                                       // the M1 probe validated resume with them present)
-    let turn: [String: Any]           // turn_context payload
 
-    /// From the most recent rollout on disk. Nil only when Codex has no sessions at all.
+    /// From the newest rollout that carries a session_meta (they all should; imported
+    /// ones included). Nil only when Codex has no sessions at all.
     static func load() -> CodexTemplates? {
         let fm = FileManager.default
         guard let e = fm.enumerator(at: CodexPaths.sessionsDir, includingPropertiesForKeys: nil)
         else { return nil }
-        var newest: (URL, Date)?
+        var rollouts: [(URL, Date)] = []
         for case let url as URL in e where url.lastPathComponent.hasPrefix("rollout-")
                                         && url.pathExtension == "jsonl" {
             let m = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date ?? .distantPast
-            if newest == nil || m > newest!.1 { newest = (url, m) }
+            rollouts.append((url, m))
         }
-        guard let (url, _) = newest else { return nil }
-        var meta: [String: Any]?, turn: [String: Any]?
-        _ = try? CodexIO.streamLines(path: url.path) { line in
-            if meta == nil, line.type == "session_meta" { meta = line.payload }
-            if turn == nil, line.type == "turn_context" { turn = line.payload }
+        for (url, _) in rollouts.sorted(by: { $0.1 > $1.1 }) {
+            var meta: [String: Any]?
+            _ = try? CodexIO.streamLines(path: url.path) { line in
+                if meta == nil, line.type == "session_meta" { meta = line.payload }
+            }
+            if let m = meta { return CodexTemplates(meta: m) }
         }
-        guard let m = meta, let t = turn else { return nil }
-        return CodexTemplates(meta: m, turn: t)
+        return nil
     }
 }
 
