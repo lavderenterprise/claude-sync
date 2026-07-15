@@ -296,7 +296,7 @@ enum Route: Identifiable {
     }
 }
 
-struct ContentView: View {
+struct AccountsView: View {
     @StateObject var store = Store()
     @State private var filter: Filter = .all
     @State private var route: Route?
@@ -501,13 +501,4 @@ struct ContentView: View {
 
 extension SyncReport: Identifiable {
     public var id: String { (backup?.path ?? "") + "\(created)-\(updated)-\(failed.count)" }
-}
-
-@main struct ClaudeSessionSyncApp: App {
-    var body: some Scene {
-        Window("Claude Session Sync", id: "main") { ContentView() }
-            .windowResizability(.contentMinSize)
-            .defaultSize(width: 1120, height: 780)
-        .commands { CommandGroup(replacing: .newItem) {} }
-    }
 }

@@ -30,8 +30,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>enterprise.lavder.claude-session-sync</string>
-  <key>CFBundleVersion</key><string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>2.0</string>
+  <key>CFBundleShortVersionString</key><string>2.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
@@ -42,8 +42,9 @@ PLIST
 # --- Executable ------------------------------------------------------------
 swiftc -O -parse-as-library \
   -target arm64-apple-macosx14.0 \
+  -lsqlite3 \
   -o "$APP/Contents/MacOS/ClaudeSessionSync" \
-  Sources/ClaudeSessionSync.swift Sources/UI.swift
+  Sources/*.swift
 
 # Ad-hoc signature: without one, macOS kills the app on launch on Apple Silicon.
 codesign --force --sign - "$APP" 2>/dev/null

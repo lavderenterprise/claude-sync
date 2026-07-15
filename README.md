@@ -1,12 +1,31 @@
 # Claude Session Sync
 
-A tiny native macOS app that shows **every Claude account used on your Mac** and **all the Claude Code sessions inside each one**, highlights what has drifted between accounts, and — with one click — backs everything up and reconciles the accounts so no session disappears when you switch login.
+A native macOS app that keeps your AI coding sessions where you expect them — across **Claude accounts** and across **assistants**:
 
-No dependencies, no Electron, no browser. A single SwiftUI binary built against the Xcode toolchain.
+- **Accounts** — shows every Claude account used on your Mac and all the Claude Code sessions inside each one, highlights what has drifted, and reconciles the account indexes with one click so no session disappears when you switch login.
+- **Codex** — bidirectional sync of chats between **Claude Code and OpenAI Codex** (the ChatGPT desktop app): full-history mirror both ways, incremental two-way updates, conflict handling, and an opt-in **auto-sync** that mirrors a chat to the other app the moment it finishes receiving a reply.
+- **Menu bar widget** — one-click sync with a live badge counting the chats waiting to sync; the app keeps working in the background with the window closed (optional launch at login).
+
+No dependencies, no Electron, no browser. A single SwiftUI binary built against the Xcode toolchain (plus the system `libsqlite3`).
 
 ---
 
-## The problem it solves
+## Codex sync (Claude Code ⇄ OpenAI Codex)
+
+The Codex tab pairs every Claude Code session with an OpenAI Codex thread and keeps both sides current:
+
+- **Full-history mirror**: every Claude session becomes a resumable Codex thread (rollout JSONL + `threads` row in `state_5.sqlite` + `session_index.jsonl`) and every Codex thread becomes a resumable Claude session (transcript with a valid uuid chain + desktop index entry). Verified end-to-end: `codex exec resume` and Claude both load the imported counterparts.
+- **Incremental two-way sync**: byte-offset cursors per side detect exactly what advanced; only the new region is converted and appended. Deterministic IDs make every operation idempotent — re-running never duplicates.
+- **Conversion fidelity**: user/assistant text is native on both sides. Tool calls cross over as readable text blocks; Claude `thinking` and Codex encrypted reasoning are skipped by design.
+- **Conflicts**: if both sides advanced since the last sync, the pair is flagged and counted in the menu bar badge — never auto-resolved. You pick the winning side; the losing side's turns stay untouched in their own transcript (recorded as skipped in the ledger).
+- **Auto-sync (opt-in)**: one FSEvents stream watches both session trees; a per-session quiet-period timer (default 20 s) fires when a reply has finished landing, and the pair syncs by itself. Self-written events are suppressed so the engine never reacts to its own writes.
+- **Safety**: a timestamped backup (Codex DB via the SQLite Online Backup API, indexes, ledger, Claude session index) precedes every writing run; transcripts are append-only with per-file `.css-bak`; every append is guarded by a fsync'd write-intent that recovers cleanly after a crash; a schema-version guard disables Codex-side writes if the (alpha) ChatGPT app changes its database format.
+
+State lives in `~/Library/Application Support/ClaudeSessionSync/` (`codex-links.json` ledger + `backups/`).
+
+---
+
+## The problem it solves (Accounts tab)
 
 The Claude desktop app stores its Claude Code **session index** partitioned per account:
 
