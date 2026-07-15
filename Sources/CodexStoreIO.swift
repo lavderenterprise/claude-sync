@@ -272,6 +272,25 @@ enum CodexWriter {
             """, [.int(Int64(updatedAtMs)), .int(Int64(updatedAtMs)), .text(id)])
     }
 
+    /// The ChatGPT UI's "organize by project" groups threads via a thread→folder hint
+    /// map in its Electron state, NOT via the threads.cwd column — unhinted threads all
+    /// collapse into one bucket. Top up missing hints for every known thread. Skipped
+    /// while ChatGPT runs (it persists its in-memory state on quit, clobbering ours).
+    static func topUpWorkspaceHints() {
+        guard !CodexIO.codexIsRunning() else { return }
+        let gs = CodexPaths.home.appending(path: ".codex-global-state.json")
+        guard var d = readJSON(gs) else { return }
+        var hints = (d["thread-workspace-root-hints"] as? [String: String]) ?? [:]
+        let before = hints.count
+        for t in CodexIO.enumerateThreads() where hints[t.id] == nil && t.cwd != "—" {
+            hints[t.id] = t.cwd
+        }
+        guard hints.count > before,
+              let data = try? JSONSerialization.data(withJSONObject:
+                  { var c = d; c["thread-workspace-root-hints"] = hints; return c }()) else { return }
+        try? data.write(to: gs, options: .atomic)
+    }
+
     /// Dedup append to the auxiliary session_index.jsonl.
     static func appendSessionIndex(id: String, name: String) throws {
         let path = CodexPaths.sessionIndex.path

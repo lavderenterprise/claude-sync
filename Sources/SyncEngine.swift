@@ -564,6 +564,7 @@ extension CodexEngine {
                                      title: s.title, firstUserMessage: firstUser,
                                      createdAtMs: s.createdAt, updatedAtMs: s.lastActivityAt)
         try CodexWriter.appendSessionIndex(id: codexId, name: s.title)
+        CodexWriter.topUpWorkspaceHints()
 
         store.pairs.append(PairRecord(
             claudeSessionId: s.cliSessionId,
