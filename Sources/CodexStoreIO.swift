@@ -291,6 +291,34 @@ enum CodexWriter {
         try? data.write(to: gs, options: .atomic)
     }
 
+    /// The ChatGPT "Projects" page lists folders registered in the Electron state
+    /// (electron-saved-workspace-roots + project-order); threads are attached to a
+    /// project by cwd. Register any pair folder that isn't a project yet, so imported
+    /// chats land inside their project instead of the flat Tasks bucket. Trust is NOT
+    /// granted here — Codex asks per-folder on first use, as it should.
+    static func topUpProjects() {
+        guard !CodexIO.codexIsRunning() else { return }
+        let gs = CodexPaths.home.appending(path: ".codex-global-state.json")
+        guard var d = readJSON(gs) else { return }
+        var roots = (d["electron-saved-workspace-roots"] as? [String]) ?? []
+        var order = (d["project-order"] as? [String]) ?? []
+        let before = roots.count
+        let fm = FileManager.default
+        for t in CodexIO.enumerateThreads() {
+            let cwd = t.cwd
+            guard cwd != "—", !cwd.contains("/Documents/Codex/"),
+                  fm.fileExists(atPath: cwd), !roots.contains(cwd) else { continue }
+            roots.append(cwd)
+            if !order.contains(cwd) { order.append(cwd) }
+        }
+        guard roots.count > before else { return }
+        d["electron-saved-workspace-roots"] = roots
+        d["project-order"] = order
+        if let data = try? JSONSerialization.data(withJSONObject: d) {
+            try? data.write(to: gs, options: .atomic)
+        }
+    }
+
     /// Dedup append to the auxiliary session_index.jsonl.
     static func appendSessionIndex(id: String, name: String) throws {
         let path = CodexPaths.sessionIndex.path

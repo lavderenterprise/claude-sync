@@ -126,6 +126,63 @@ final class CodexEngine {
     }
 }
 
+// MARK: - Stale fork-siblings (account-switch relics)
+
+extension CodexEngine {
+    /// An account switch forks sessions: the continuation gets a new cliSessionId with
+    /// the SAME createdAt+cwd, and the original strands in the now-inactive account's
+    /// index. Claude shows only the active account's copy; our multi-account union
+    /// imports both (no data loss), so the mirror ends up with a visible "duplicate".
+    /// This archives the stranded copy's Codex thread via the official RPC — reversible,
+    /// and the pre-switch history stays available in the archive.
+    func archiveStaleForkThreads() -> Int {
+        // Active account = same ranking used everywhere: activity, then entries, then uuid.
+        let accounts = discoverAccounts()
+        let ranked = accounts.sorted { a, b in
+            func rank(_ dir: URL) -> (Int, Int) {
+                let files = sessionFiles(in: dir)
+                let act = files.compactMap { readJSON($0) }
+                    .map { num($0["lastActivityAt"]) }.max() ?? 0
+                return (act, files.count)
+            }
+            let ra = rank(a.value), rb = rank(b.value)
+            if ra.0 != rb.0 { return ra.0 > rb.0 }
+            if ra.1 != rb.1 { return ra.1 > rb.1 }
+            return a.key < b.key
+        }
+        guard let active = ranked.first?.key else { return 0 }
+
+        // (createdAt, cwd) → cliSessionId → accounts that index it.
+        var groups: [String: [String: Set<String>]] = [:]
+        for (acc, dir) in accounts {
+            for file in sessionFiles(in: dir) {
+                guard let d = readJSON(file), let cli = d["cliSessionId"] as? String,
+                      let cwd = d["cwd"] as? String else { continue }
+                let key = "\(num(d["createdAt"]))|\(cwd)"
+                groups[key, default: [:]][cli, default: []].insert(acc)
+            }
+        }
+
+        guard let store = try? LinkStoreIO.load() else { return 0 }
+        let pairByClaude = Dictionary(uniqueKeysWithValues:
+            store.pairs.map { ($0.claudeSessionId, $0) })
+        let archivedIds = Set(CodexIO.enumerateThreads().filter(\.archived).map(\.id))
+
+        var targets: [String] = []
+        for (_, clis) in groups where clis.count > 1 {
+            let hasActive = clis.values.contains { $0.contains(active) }
+            guard hasActive else { continue }
+            for (cli, accs) in clis where !accs.contains(active) {
+                if let pair = pairByClaude[cli], !archivedIds.contains(pair.codexThreadId) {
+                    targets.append(pair.codexThreadId)
+                }
+            }
+        }
+        guard !targets.isEmpty else { return 0 }
+        return AppServerRPC.archiveThreads(targets)
+    }
+}
+
 // MARK: - Integrity doctor
 
 struct PairIssue: Identifiable {
@@ -456,6 +513,7 @@ extension CodexEngine {
             }
             progress(BulkProgress(done: ordered.count, total: ordered.count, current: ""))
             try LinkStoreIO.save(store)
+            _ = archiveStaleForkThreads()
         } catch {
             report.failed.append(CodexFailure(title: "run", side: "-", reason: plainReason(error)))
         }
@@ -565,6 +623,7 @@ extension CodexEngine {
                                      createdAtMs: s.createdAt, updatedAtMs: s.lastActivityAt)
         try CodexWriter.appendSessionIndex(id: codexId, name: s.title)
         CodexWriter.topUpWorkspaceHints()
+        CodexWriter.topUpProjects()
 
         store.pairs.append(PairRecord(
             claudeSessionId: s.cliSessionId,
