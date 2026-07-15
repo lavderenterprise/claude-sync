@@ -126,6 +126,135 @@ final class CodexEngine {
     }
 }
 
+// MARK: - Integrity doctor
+
+struct PairIssue: Identifiable {
+    let id = UUID()
+    let pairTitle: String
+    let side: String                  // "claude" | "codex" | "ledger"
+    let detail: String
+}
+
+extension CodexEngine {
+    /// Structural validation of every pair — the guard against broken sessions
+    /// compounding across ping-pong syncs. Read-only.
+    func verifyAll() -> [PairIssue] {
+        var issues: [PairIssue] = []
+        guard let store = try? LinkStoreIO.load() else {
+            return [PairIssue(pairTitle: "ledger", side: "ledger",
+                              detail: "codex-links.json unreadable")]
+        }
+        let fm = FileManager.default
+
+        for rec in store.pairs {
+            let title = rec.title
+
+            // Ledger vs disk coherence.
+            let cSize = (try? fm.attributesOfItem(atPath: rec.claudeTranscriptPath))?[.size] as? Int64
+            let xSize = (try? fm.attributesOfItem(atPath: rec.codexRolloutPath))?[.size] as? Int64
+            if cSize == nil { issues.append(.init(pairTitle: title, side: "claude",
+                                                  detail: "transcript missing on disk")) }
+            if xSize == nil { issues.append(.init(pairTitle: title, side: "codex",
+                                                  detail: "rollout missing on disk")) }
+            if let c = cSize, c < rec.claude.byteOffset {
+                issues.append(.init(pairTitle: title, side: "ledger",
+                                    detail: "claude cursor beyond file size (rewritten?)"))
+            }
+            if let x = xSize, x < rec.codex.byteOffset {
+                issues.append(.init(pairTitle: title, side: "ledger",
+                                    detail: "codex cursor beyond file size (rewritten?)"))
+            }
+            if rec.inFlight != nil {
+                issues.append(.init(pairTitle: title, side: "ledger",
+                                    detail: "unrecovered in-flight write intent"))
+            }
+
+            // Claude transcript: uuid chain + tool_use/tool_result pairing.
+            // Calibrated against native reality: compaction legitimately prunes chain
+            // heads and retries fork the DAG, so the strict parent check applies only
+            // to lines WE wrote; and the last tool_use of a live session is allowed to
+            // be momentarily unpaired (its result simply hasn't landed yet).
+            if cSize != nil {
+                var allUuids = Set<String>()
+                var ourOrphanParents = 0
+                var pendingOurParents: [String] = []   // our lines' parents, checked after pass
+                var toolUseLine: [String: Int] = [:]   // id → line index of the use
+                var toolResults = Set<String>()
+                var lastToolUseLineIdx = -1
+                var lineIdx = -1
+                var chainTailSeen = rec.claudeChainTail == nil
+                _ = try? ClaudeIO.streamLines(path: rec.claudeTranscriptPath) { line in
+                    lineIdx += 1
+                    if let u = line.uuid {
+                        allUuids.insert(u)
+                        if u == rec.claudeChainTail { chainTailSeen = true }
+                        if line.syncOrigin != nil, let p = line.parentUuid, !p.isEmpty {
+                            pendingOurParents.append(p)
+                        }
+                    }
+                    guard let items = line.message?["content"] as? [[String: Any]] else { return }
+                    for item in items {
+                        switch item["type"] as? String {
+                        case "tool_use":
+                            if let id = item["id"] as? String {
+                                toolUseLine[id] = lineIdx
+                                lastToolUseLineIdx = lineIdx
+                            }
+                        case "tool_result":
+                            if let id = item["tool_use_id"] as? String { toolResults.insert(id) }
+                        default: break
+                        }
+                    }
+                }
+                ourOrphanParents = pendingOurParents.filter { !allUuids.contains($0) }.count
+                if ourOrphanParents > 0 {
+                    issues.append(.init(pairTitle: title, side: "claude",
+                                        detail: "\(ourOrphanParents) synced lines with unknown parentUuid"))
+                }
+                // Unpaired uses are broken only when a LATER tool_use exists (i.e. the
+                // conversation moved on without the result) — a trailing one is in flight.
+                let broken = toolUseLine.filter { !toolResults.contains($0.key)
+                                                  && $0.value < lastToolUseLineIdx }
+                if !broken.isEmpty {
+                    issues.append(.init(pairTitle: title, side: "claude",
+                                        detail: "\(broken.count) tool_use without tool_result (breaks resume)"))
+                }
+                if !chainTailSeen {
+                    issues.append(.init(pairTitle: title, side: "ledger",
+                                        detail: "chain tail uuid not present in transcript"))
+                }
+            }
+
+            // Codex rollout: session_meta identity + turn balance.
+            if xSize != nil {
+                var metaId: String?
+                var started = 0, completed = 0
+                _ = try? CodexIO.streamLines(path: rec.codexRolloutPath) { line in
+                    if metaId == nil, line.type == "session_meta" {
+                        metaId = line.payload["id"] as? String
+                    }
+                    if line.type == "event_msg" {
+                        if line.payloadType == "task_started" { started += 1 }
+                        if line.payloadType == "task_complete" { completed += 1 }
+                    }
+                }
+                if metaId == nil {
+                    issues.append(.init(pairTitle: title, side: "codex",
+                                        detail: "rollout has no session_meta"))
+                } else if metaId != rec.codexThreadId {
+                    issues.append(.init(pairTitle: title, side: "codex",
+                                        detail: "session_meta id ≠ thread id"))
+                }
+                if started < completed {
+                    issues.append(.init(pairTitle: title, side: "codex",
+                                        detail: "more task_complete than task_started"))
+                }
+            }
+        }
+        return issues
+    }
+}
+
 // MARK: - Backups (one set per writing run; sqlite via the Online Backup API)
 
 enum BackupManager {
@@ -484,6 +613,11 @@ extension CodexEngine {
                 }
             }
             if let e = pendingError { throw e }
+            let tail = emitter.finish()             // settle any dangling tool calls
+            if !tail.isEmpty {
+                try write(tail)
+                claudeLineCount += tail.count
+            }
             let title: [String: Any] = ["type": "custom-title", "customTitle": t.title,
                                         "sessionId": claudeId]
             try write([title])
@@ -616,6 +750,12 @@ extension CodexEngine {
         let consumed = try CodexIO.streamLines(path: rec.codexRolloutPath,
                                                from: rec.codex.byteOffset) { line in
             lines.append(contentsOf: emitter.feed(line))
+        }
+        if emitter.hasPendingCalls {
+            // A tool call is still awaiting its output (long-running tool caught by the
+            // quiescence window). Don't fabricate a result — skip this round entirely;
+            // the next scan re-reads the same region once the turn has settled.
+            return
         }
 
         let newCodex = SideCursor(byteOffset: consumed,

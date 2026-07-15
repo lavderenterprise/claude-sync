@@ -15,12 +15,14 @@ enum CodexRoute: Identifiable {
     case confirmAll
     case resolve(PairRow)
     case result(CodexSyncReport)
+    case verify(CodexStore.VerifyResult)
 
     var id: String {
         switch self {
         case .confirmAll: "confirmAll"
         case .resolve(let r): "resolve-" + r.id
         case .result(let rep): "result-" + rep.id
+        case .verify(let v): "verify-" + v.id
         }
     }
 }
@@ -60,6 +62,13 @@ struct CodexContent: View {
                 .help("Re-scan both sides from disk")
             }
             ToolbarItem(placement: .primaryAction) {
+                Button { store.verify() } label: {
+                    Label("Verify", systemImage: "stethoscope")
+                }
+                .disabled(store.busy)
+                .help("Structural check of every pair: uuid chains, tool pairing, cursors")
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button { route = .confirmAll } label: {
                     Label(store.actionableCount == 0 ? "Sync all"
                           : "Sync all (\(store.actionableCount))",
@@ -81,10 +90,16 @@ struct CodexContent: View {
             case .result(let rep):
                 CodexResultSheet(report: rep, codexRunning: store.codexRunning)
                     .onDisappear { store.report = nil }
+            case .verify(let v):
+                VerifySheet(result: v)
+                    .onDisappear { store.verifyResult = nil }
             }
         }
         .onChange(of: store.report?.id) { _, id in
             if id != nil, let rep = store.report { route = .result(rep) }
+        }
+        .onChange(of: store.verifyResult?.id) { _, id in
+            if id != nil, let v = store.verifyResult { route = .verify(v) }
         }
         .overlay {
             if let bulk = store.bulk {
@@ -391,6 +406,65 @@ struct ResolveSheet: View {
         .frame(maxWidth: .infinity, minHeight: 128, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator.opacity(0.6)))
+    }
+}
+
+// MARK: - Verify sheet (integrity doctor results)
+
+struct VerifySheet: View {
+    let result: CodexStore.VerifyResult
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: 11) {
+                Image(systemName: result.issues.isEmpty
+                      ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    .font(.system(size: 22))
+                    .foregroundStyle(result.issues.isEmpty ? .green : .orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(result.issues.isEmpty ? "All pairs are structurally sound"
+                         : "\(result.issues.count) issues found")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("Checked \(result.pairsChecked) pairs: uuid chains, tool_use/tool_result pairing, rollout structure, ledger cursors.")
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+
+            if !result.issues.isEmpty {
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(result.issues) { issue in
+                            HStack(alignment: .top, spacing: 6) {
+                                Chip(text: issue.side.uppercased(), tint: .orange)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(issue.pairTitle).font(.system(size: 11.5, weight: .medium))
+                                        .lineLimit(1)
+                                    Text(issue.detail).font(.system(size: 10.5))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 300)
+            }
+
+            HStack {
+                Spacer()
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+            }
+            .padding(16)
+        }
+        .frame(width: 520)
     }
 }
 

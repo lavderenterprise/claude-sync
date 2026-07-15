@@ -281,8 +281,15 @@ final class ClaudeToCodexEmitter {
     var nextTurnIndex: Int { turnIndex }
 }
 
-// MARK: - Codex → Claude (incremental emitter)
+// MARK: - Codex → Claude (incremental emitter, NATIVE tool blocks)
 
+/// Emits native Claude transcript structures: Codex `function_call` becomes a real
+/// `tool_use` block and its output a real `tool_result` user line — Claude renders
+/// arbitrary tool names natively (that is how MCP tools work), so the mirrored session
+/// looks and resumes like a home-grown one. Invariant enforced for API validity: every
+/// emitted tool_use is ALWAYS followed by a matching tool_result; a call whose output
+/// never arrives gets a synthesized "[no output recorded]" result instead of being
+/// dropped (the old text-tag emitter silently lost those).
 final class CodexToClaudeEmitter {
     struct Stats {
         var consumedLineCount = 0
@@ -296,8 +303,14 @@ final class CodexToClaudeEmitter {
     private let model: String
     private var parent: String?
     private var index: Int
-    private var pendingCalls: [String: String] = [:]
+    /// Calls awaiting their output, in arrival order: (call_id, tool name, input).
+    private var pendingCalls: [(id: String, name: String, input: Any)] = []
     private(set) var stats = Stats()
+
+    /// Codex-injected control payloads that must not bounce between the apps.
+    private static let controlPrefixes = ["<environment_context>", "<user_instructions>",
+                                          "<permissions", "<recommended_plugins",
+                                          "<model_switch", "<EXTERNAL SESSION IMPORTED>"]
 
     init(claudeSessionId: String, codexId: String, cwd: String, model: String,
          chainTail: String?, startLineIndex: Int) {
@@ -311,6 +324,9 @@ final class CodexToClaudeEmitter {
 
     var chainTail: String? { parent }
     var nextLineIndex: Int { index }
+    /// True while a function_call has no output yet — at EOF this means the turn is
+    /// still in flight and an incremental sync should wait rather than fabricate.
+    var hasPendingCalls: Bool { !pendingCalls.isEmpty }
 
     /// Canonical-source rule: user turns from `event_msg user_message` ONLY, assistant
     /// text from `response_item message role:assistant` ONLY — rollouts carry each
@@ -323,8 +339,12 @@ final class CodexToClaudeEmitter {
         switch line.type {
         case "event_msg":
             guard line.payloadType == "user_message",
-                  let text = line.payload["message"] as? String, !text.isEmpty else { return [] }
-            return [emit("user", ["role": "user", "content": text], ts: ts)]
+                  let text = line.payload["message"] as? String, !text.isEmpty,
+                  !isControl(text) else { return [] }
+            // A user turn interrupts any in-flight tool call: settle pairs first.
+            var out = flushPendingCalls(ts: ts)
+            out.append(emit("user", ["role": "user", "content": text], ts: ts))
+            return out
 
         case "response_item":
             switch line.payloadType {
@@ -336,24 +356,33 @@ final class CodexToClaudeEmitter {
                           t == "output_text" || t == "text" else { return nil }
                     return item["text"] as? String
                 }.joined(separator: "\n\n")
-                guard !text.isEmpty else { return [] }
-                return [emit("assistant", assistantEnvelope(text: text), ts: ts)]
+                guard !text.isEmpty, !isControl(text) else { return [] }
+                var out = flushPendingCalls(ts: ts)
+                out.append(emit("assistant", assistantEnvelope(
+                    content: [["type": "text", "text": text]]), ts: ts))
+                return out
 
             case "function_call", "custom_tool_call":
-                let name = (line.payload["name"] as? String) ?? "?"
-                let block = renderToolUse(name: "Codex " + name, input: line.payload["arguments"])
-                if let cid = line.payload["call_id"] as? String {
-                    pendingCalls[cid] = block
-                    return []
-                }
-                return [emit("assistant", assistantEnvelope(text: block), ts: ts)]
+                let name = (line.payload["name"] as? String) ?? "tool"
+                let cid = (line.payload["call_id"] as? String)
+                    ?? DeterministicID.uuidV5("call:\(codexId)#\(index)")
+                pendingCalls.append((id: cid, name: name,
+                                     input: parseArguments(line.payload["arguments"])))
+                return []                          // emitted when its output arrives
 
             case "function_call_output", "custom_tool_call_output":
                 let cid = (line.payload["call_id"] as? String) ?? ""
-                let call = pendingCalls.removeValue(forKey: cid) ?? "⏺ Codex tool call"
-                let out = flattenContent(line.payload["output"])
-                let text = call + "\n" + renderToolResult(out, isError: false)
-                return [emit("assistant", assistantEnvelope(text: text), ts: ts)]
+                let output = flattenContent(line.payload["output"])
+                if let i = pendingCalls.firstIndex(where: { $0.id == cid }) {
+                    let call = pendingCalls.remove(at: i)
+                    return emitToolPair(call: call, output: output, isError: false, ts: ts)
+                }
+                // Output without a recorded call (shouldn't happen): keep the data
+                // anyway as a plain assistant note rather than dropping it.
+                guard !output.isEmpty else { return [] }
+                return [emit("assistant", assistantEnvelope(
+                    content: [["type": "text", "text": renderToolResult(output, isError: false)]]),
+                    ts: ts)]
 
             default:
                 return []                           // reasoning (encrypted) etc.
@@ -366,6 +395,63 @@ final class CodexToClaudeEmitter {
             stats.skippedUnknown += 1
             return []
         }
+    }
+
+    /// Settle any dangling calls before the stream ends — never leave a tool_use
+    /// unpaired (API-invalid) and never drop a recorded call (data loss).
+    func finish() -> [[String: Any]] {
+        flushPendingCalls(ts: stats.lastTimestamp.isEmpty ? isoNow() : stats.lastTimestamp)
+    }
+
+    private func flushPendingCalls(ts: String) -> [[String: Any]] {
+        guard !pendingCalls.isEmpty else { return [] }
+        var out: [[String: Any]] = []
+        for call in pendingCalls {
+            out.append(contentsOf: emitToolPair(call: call, output: "[no output recorded]",
+                                                isError: false, ts: ts))
+        }
+        pendingCalls.removeAll()
+        return out
+    }
+
+    /// One assistant line with the native tool_use block + one user line with the
+    /// matching tool_result — exactly the shape Claude Code writes for its own tools.
+    private func emitToolPair(call: (id: String, name: String, input: Any),
+                              output: String, isError: Bool, ts: String) -> [[String: Any]] {
+        let use = emit("assistant", assistantEnvelope(content: [[
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": call.input,
+        ]], stopReason: "tool_use"), ts: ts)
+
+        var resultItem: [String: Any] = [
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": [["type": "text", "text": output]],
+        ]
+        if isError { resultItem["is_error"] = true }
+        var result = emit("user", ["role": "user", "content": [resultItem]], ts: ts)
+        result["toolUseResult"] = output
+        result["sourceToolUseID"] = call.id
+        return [use, result]
+    }
+
+    private func isControl(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Self.controlPrefixes.contains { t.hasPrefix($0) }
+    }
+
+    /// Codex stores `arguments` as a JSON string; Claude's tool_use `input` is an object.
+    private func parseArguments(_ raw: Any?) -> Any {
+        if let s = raw as? String {
+            if let data = s.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) {
+                return obj
+            }
+            return ["raw": s]
+        }
+        return raw ?? [:]
     }
 
     private func emit(_ type: String, _ message: [String: Any], ts: String) -> [String: Any] {
@@ -391,14 +477,15 @@ final class CodexToClaudeEmitter {
         return line
     }
 
-    private func assistantEnvelope(text: String) -> [String: Any] {
+    private func assistantEnvelope(content: [[String: Any]],
+                                   stopReason: String = "end_turn") -> [String: Any] {
         [
             "id": "msg_css_\(index + 1)",
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": [["type": "text", "text": text]],
-            "stop_reason": "end_turn",
+            "content": content,
+            "stop_reason": stopReason,
             "stop_sequence": NSNull(),
             "usage": ["input_tokens": 0, "output_tokens": 0],
         ]

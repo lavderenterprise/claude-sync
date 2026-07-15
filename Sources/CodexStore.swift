@@ -100,4 +100,27 @@ import SwiftUI
     var actionableCount: Int {
         rows.filter { $0.isPending || $0.state == .unlinkedClaude || $0.state == .unlinkedCodex }.count
     }
+
+    @Published var verifyResult: VerifyResult?
+
+    struct VerifyResult: Identifiable {
+        let issues: [PairIssue]
+        let pairsChecked: Int
+        var id: String { "\(pairsChecked)-\(issues.count)" }
+    }
+
+    /// Read-only structural validation of every pair (the "doctor").
+    func verify() {
+        guard !busy else { return }
+        busy = true
+        let engine = self.engine
+        let count = rows.count
+        Task.detached(priority: .userInitiated) {
+            let issues = engine.verifyAll()
+            await MainActor.run {
+                self.verifyResult = VerifyResult(issues: issues, pairsChecked: count)
+                self.busy = false
+            }
+        }
+    }
 }

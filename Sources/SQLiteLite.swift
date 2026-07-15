@@ -128,7 +128,11 @@ final class SQLiteDB {
 /// the backup API, which stays as fallback.
 func sqliteOnlineBackup(from src: String, to dst: String) throws {
     try? FileManager.default.removeItem(atPath: dst)      // VACUUM INTO refuses existing files
-    if let db = try? SQLiteDB(path: src, readOnly: true) {
+    // Read-write open (never CREATE): a read-only connection cannot recover an orphaned
+    // WAL (owner app closed/restarted mid-write) and fails with CANTOPEN; opening rw
+    // performs the recovery without touching a single row.
+    for readOnly in [false, true] {
+        guard let db = try? SQLiteDB(path: src, readOnly: readOnly) else { continue }
         let escaped = dst.replacingOccurrences(of: "'", with: "''")
         if (try? db.run("VACUUM INTO '\(escaped)'")) != nil { return }
     }
@@ -139,9 +143,11 @@ private func sqliteBackupAPI(from src: String, to dst: String) throws {
     var srcDB: OpaquePointer?
     var dstDB: OpaquePointer?
     defer { sqlite3_close(srcDB); sqlite3_close(dstDB) }
-    guard sqlite3_open_v2(src, &srcDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+    // rw for the same WAL-recovery reason as above (still no CREATE, still no writes).
+    guard sqlite3_open_v2(src, &srcDB, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
         throw SQLiteError(message: "cannot open source for backup: \(src)", code: -1)
     }
+    sqlite3_busy_timeout(srcDB, 5000)
     guard sqlite3_open_v2(dst, &dstDB, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
         throw SQLiteError(message: "cannot create backup target: \(dst)", code: -1)
     }
