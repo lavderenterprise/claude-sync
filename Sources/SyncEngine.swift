@@ -668,6 +668,7 @@ extension CodexEngine {
         try CodexWriter.appendSessionIndex(id: codexId, name: s.title)
         CodexWriter.topUpWorkspaceHints()
         CodexWriter.topUpProjects()
+        report.wroteCodexSide = true
 
         store.pairs.append(PairRecord(
             claudeSessionId: s.cliSessionId,
@@ -754,6 +755,7 @@ extension CodexEngine {
             claudeEmitIndex: emitter.nextLineIndex,
             skipped: [],
             inFlight: nil))
+        report.wroteClaudeSide = true
         report.created += 1
     }
 
@@ -837,6 +839,7 @@ extension CodexEngine {
         rec.state = PairState.synced.rawValue
         rec.lastSyncAt = isoNow()
         store.pairs[idx] = rec
+        report.wroteCodexSide = true
         report.updated += 1
     }
 
@@ -902,6 +905,7 @@ extension CodexEngine {
         rec.state = PairState.synced.rawValue
         rec.lastSyncAt = isoNow()
         store.pairs[idx] = rec
+        report.wroteClaudeSide = true
         report.updated += 1
     }
 }

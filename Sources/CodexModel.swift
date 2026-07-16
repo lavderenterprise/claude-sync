@@ -40,6 +40,10 @@ struct CodexSyncReport: Identifiable {
     var failed: [CodexFailure] = []
     var fatal: CodexFatal?
     var backupDir: URL?
+    // Which stores were written — drives the correct "restart X" hint (a Keep-Codex
+    // resolve writes only the Claude side; telling the user to restart ChatGPT is noise).
+    var wroteCodexSide = false
+    var wroteClaudeSide = false
     var ok: Bool { fatal == nil && failed.isEmpty }
     var id: String { "\(created)-\(updated)-\(failed.count)-\(backupDir?.path ?? "")" }
 }

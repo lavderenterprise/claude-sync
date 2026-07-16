@@ -88,7 +88,7 @@ struct CodexContent: View {
             case .resolve(let row):
                 ResolveSheet(row: row) { dir in store.resolve(row, winner: dir) }
             case .result(let rep):
-                CodexResultSheet(report: rep, codexRunning: store.codexRunning)
+                CodexResultSheet(report: rep, codexRunning: store.codexRunning, claudeRunning: store.claudeRunning)
                     .onDisappear { store.report = nil }
             case .verify(let v):
                 VerifySheet(result: v)
@@ -499,6 +499,7 @@ struct VerifySheet: View {
 struct CodexResultSheet: View {
     let report: CodexSyncReport
     let codexRunning: Bool
+    let claudeRunning: Bool
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -555,12 +556,22 @@ struct CodexResultSheet: View {
             }
             .padding(16)
 
-            if report.ok && report.created + report.updated > 0 && codexRunning {
+            if report.ok && report.created + report.updated > 0
+                && (report.wroteCodexSide && codexRunning || report.wroteClaudeSide) {
                 Divider()
-                Notice(icon: "arrow.clockwise",
-                       text: "Restart the ChatGPT app to see imported threads in its list.",
-                       tint: .blue)
-                    .padding(16)
+                VStack(alignment: .leading, spacing: 6) {
+                    if report.wroteCodexSide && codexRunning {
+                        Notice(icon: "arrow.clockwise",
+                               text: "Restart the ChatGPT app to see the changes in its list.",
+                               tint: .blue)
+                    }
+                    if report.wroteClaudeSide && claudeRunning {
+                        Notice(icon: "arrow.clockwise",
+                               text: "The Claude app re-reads its session list only on launch — quit and reopen it to see the changes there.",
+                               tint: .blue)
+                    }
+                }
+                .padding(16)
             }
 
             HStack {
