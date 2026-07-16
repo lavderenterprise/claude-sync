@@ -16,10 +16,13 @@ The Codex tab pairs every Claude Code session with an OpenAI Codex thread and ke
 
 - **Full-history mirror**: every Claude session becomes a resumable Codex thread (rollout JSONL + `threads` row in `state_5.sqlite` + `session_index.jsonl`) and every Codex thread becomes a resumable Claude session (transcript with a valid uuid chain + desktop index entry). Verified end-to-end: `codex exec resume` and Claude both load the imported counterparts.
 - **Incremental two-way sync**: byte-offset cursors per side detect exactly what advanced; only the new region is converted and appended. Deterministic IDs make every operation idempotent — re-running never duplicates.
-- **Conversion fidelity**: user/assistant text is native on both sides. Tool calls cross over as readable text blocks; Claude `thinking` and Codex encrypted reasoning are skipped by design.
+- **Conversion fidelity**: Claude → Codex replicates OpenAI's own (currently server-disabled) `/import` renderer bit for bit — bounded `[external_agent_tool_call]` / `[external_agent_tool_result]` tags with key fields extracted, readable turn ids, `<EXTERNAL SESSION IMPORTED>` footer and token estimate (derived from the `codex-rs/external-agent-migration` source). Codex → Claude goes one better: `function_call`s become **native `tool_use`/`tool_result` blocks** (Claude renders arbitrary tool names natively — that's how MCP tools work), with every call guaranteed a paired result: missing outputs are synthesized on full imports, and incremental syncs wait when a call is still in flight. Claude `thinking` and Codex encrypted reasoning are skipped by design; Codex-injected control payloads are filtered so they never bounce between apps.
+- **Turn-aware, not just timer-aware**: a session whose grown side is mid-turn shows as `working…` — excluded from the badge, from Sync all and from auto-sync. "Mid-turn" is semantic, read from the file tail (an unanswered prompt, a pending tool result, an open `task_started`), because a long-running tool keeps the file silent while the turn is wide open; a 10-minute staleness cap releases abandoned turns.
 - **Conflicts**: if both sides advanced since the last sync, the pair is flagged and counted in the menu bar badge — never auto-resolved. You pick the winning side; the losing side's turns stay untouched in their own transcript (recorded as skipped in the ledger).
 - **Auto-sync (opt-in)**: one FSEvents stream watches both session trees; a per-session quiet-period timer (default 20 s) fires when a reply has finished landing, and the pair syncs by itself. Self-written events are suppressed so the engine never reacts to its own writes.
-- **Safety**: a timestamped backup (Codex DB via the SQLite Online Backup API, indexes, ledger, Claude session index) precedes every writing run; transcripts are append-only with per-file `.css-bak`; every append is guarded by a fsync'd write-intent that recovers cleanly after a crash; a schema-version guard disables Codex-side writes if the (alpha) ChatGPT app changes its database format.
+- **Integrity doctor (Verify)**: read-only structural check of every pair — uuid chains of synced lines, tool_use/tool_result pairing (in-flight tails tolerated, native compaction/forks respected), rollout `session_meta` identity and turn balance, ledger-cursor coherence. Broken sessions surface before ping-pong syncing can amplify them.
+- **ChatGPT UI integration**: imports register each thread's folder in the app's Projects list and write the thread→folder hints its "organize by project" view actually reads (with no trust granted — Codex still asks per folder). Account-switch relics (the same session forked across accounts, the original stranded in an inactive account) get their mirror thread auto-archived via the official `thread/archive` RPC — writing `archived=1` to sqlite directly gets reverted by the app; the ledger follows the rollout when archiving moves it to `archived_sessions/`.
+- **Safety**: a timestamped backup (Codex DB via `VACUUM INTO` with the Online Backup API as fallback, indexes, ledger, Claude session index) precedes every writing run; transcripts are append-only with per-file `.css-bak`; every append is guarded by a fsync'd write-intent that recovers cleanly after a crash; a schema-version guard disables Codex-side writes if the (alpha) ChatGPT app changes its database format.
 
 State lives in `~/Library/Application Support/ClaudeSessionSync/` (`codex-links.json` ledger + `backups/`).
 
@@ -109,13 +112,28 @@ open ClaudeSessionSync.app
 ### Project layout
 
 ```
-Sources/ClaudeSessionSync.swift   Core logic — disk scan, model, winner rule, merge, backup, sync
-Sources/UI.swift                  SwiftUI views — stats, account cards, table, plan/result sheets
+Sources/App.swift                 Scene, AppDelegate (background lifecycle), TabView shell
+Sources/AppModel.swift            App-scoped root model: watcher wiring, auto-sync coordinator, badge
+Sources/ClaudeSessionSync.swift   Accounts engine — index scan, winner rule, merge, backup, sync
+Sources/UI.swift                  Accounts tab views (stats, cards, table, plan/result sheets)
+Sources/CodexModel.swift          Pair model, states, sync report, user-facing fatal errors
+Sources/LinkStore.swift           Pair ledger: side cursors, write intents, atomic tmp+bak persistence
+Sources/ClaudeStore.swift         Claude side: streaming JSONL parser/writers, turn-in-flight detection
+Sources/CodexStoreIO.swift        Codex side: rollout I/O, threads-DB writers, templates, UI-state top-ups
+Sources/Conversion.swift          Both converters (native-importer-parity + native tool blocks), deterministic IDs
+Sources/SyncEngine.swift          Scan, change detection, executors, conflicts, mass import, doctor, backups
+Sources/SQLiteLite.swift          Zero-dependency SQLite wrapper + live-DB backup (VACUUM INTO / backup API)
+Sources/AppServerRPC.swift        JSON-RPC client for `codex app-server` (durable thread archiving)
+Sources/Watcher.swift             FSEvents stream, quiescence debouncer, self-event suppression gate
+Sources/MenuBar.swift             Menu bar extra: badge label + quick-sync menu
+Sources/CodexStore.swift          Codex tab store (UI state, async operation dispatch)
+Sources/CodexUI.swift             Codex tab views: pair table, plan/resolve/result/verify sheets
+Sources/SettingsUI.swift          Settings tab: auto-sync, quiet period, menu bar, login item
 Icon/AppIcon.icon                 App icon, authored in Apple Icon Composer
 build.sh                          Compiles the icon (actool), bundles, and signs ClaudeSessionSync.app
 ```
 
-The core logic is fully separated from the UI. Everything that reads or writes disk lives in `ClaudeSessionSync.swift`; `UI.swift` only presents it.
+Engine code never imports SwiftUI views and vice versa: everything that touches disk lives in the store/engine files; the `*UI.swift` files only present it.
 
 ### App icon
 
