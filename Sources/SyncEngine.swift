@@ -60,9 +60,10 @@ final class CodexEngine {
 
             var (state, reason) = pairState(rec: rec, claudeSize: claudeSize, codexSize: codexSize)
 
-            // A freshly-written grown side means the agent is still mid-turn: showing
-            // "to sync" (or judging a conflict) now would be premature — the same quiet
-            // window the auto-sync debouncer uses decides when it's really settled.
+            // A grown side that is still mid-turn must not read as "to sync" (or as a
+            // conflict). Two signals, both required to be quiet: recent writes (the
+            // auto-sync quiet window) AND tail semantics — a long-running tool keeps
+            // the file silent for minutes while the turn is very much open.
             if state == .pendingToCodex || state == .pendingToClaude || state == .conflict {
                 let quiet = max(5, UserDefaults.standard.double(forKey: "quiescenceSeconds")
                                    .isZero ? 20 : UserDefaults.standard.double(forKey: "quiescenceSeconds"))
@@ -72,7 +73,13 @@ final class CodexEngine {
                 }
                 let claudeGrew = (claudeSize ?? 0) > rec.claude.byteOffset
                 let codexGrew = (codexSize ?? 0) > rec.codex.byteOffset
-                if (claudeGrew && isHot(claudeAttrs)) || (codexGrew && isHot(codexAttrs)) {
+                let claudeBusy = claudeGrew && (isHot(claudeAttrs)
+                    || ClaudeIO.turnInFlight(path: rec.claudeTranscriptPath,
+                                             mtime: claudeAttrs?[.modificationDate] as? Date))
+                let codexBusy = codexGrew && (isHot(codexAttrs)
+                    || CodexIO.turnInFlight(path: rec.codexRolloutPath,
+                                            mtime: codexAttrs?[.modificationDate] as? Date))
+                if claudeBusy || codexBusy {
                     state = .working
                     reason = nil
                 }
@@ -775,10 +782,22 @@ extension CodexEngine {
         if claudeSize < rec.claude.byteOffset || codexSize < rec.codex.byteOffset {
             throw EngineError.conflictNeedsResolve("a side was rewritten")
         }
+        // Never convert an open turn: a long tool keeps the file quiet past the
+        // debounce window, but the tail says the agent is still working — skip this
+        // round; the next quiescence (or the staleness cap) will pick it up whole.
+        let fmDate: (String) -> Date? = {
+            (try? fm.attributesOfItem(atPath: $0))?[.modificationDate] as? Date
+        }
         switch (claudeGrew, codexGrew) {
         case (true, true): throw EngineError.conflictNeedsResolve("both sides advanced")
-        case (true, false): try incrementalToCodex(at: idx, store: &store, report: &report)
-        case (false, true): try incrementalToClaude(at: idx, store: &store, report: &report)
+        case (true, false):
+            guard !ClaudeIO.turnInFlight(path: rec.claudeTranscriptPath,
+                                         mtime: fmDate(rec.claudeTranscriptPath)) else { return }
+            try incrementalToCodex(at: idx, store: &store, report: &report)
+        case (false, true):
+            guard !CodexIO.turnInFlight(path: rec.codexRolloutPath,
+                                        mtime: fmDate(rec.codexRolloutPath)) else { return }
+            try incrementalToClaude(at: idx, store: &store, report: &report)
         case (false, false): break                          // already in sync
         }
     }

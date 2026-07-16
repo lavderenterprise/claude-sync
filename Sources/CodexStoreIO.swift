@@ -132,6 +132,22 @@ enum CodexIO {
     }
 }
 
+extension CodexIO {
+    /// A rollout turn is open while its last task_started has no matching
+    /// task_complete (long tools keep the file silent for minutes — mtime alone lies).
+    static func turnInFlight(path: String, mtime: Date?) -> Bool {
+        if let m = mtime, Date().timeIntervalSince(m) > inFlightStalenessCap { return false }
+        var lastStarted = -1, lastCompleted = -1
+        for (i, dict) in tailJSONLLines(path: path).enumerated() {
+            guard (dict["type"] as? String) == "event_msg",
+                  let pt = (dict["payload"] as? [String: Any])?["type"] as? String else { continue }
+            if pt == "task_started" { lastStarted = i }
+            if pt == "task_complete" || pt == "turn_aborted" { lastCompleted = i }
+        }
+        return lastStarted > lastCompleted
+    }
+}
+
 // MARK: - Templates: new rollouts clone the shape of a real one
 
 struct CodexTemplates {

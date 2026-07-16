@@ -85,7 +85,55 @@ enum ClaudeIO {
     }
 }
 
-// MARK: - Claude writers
+// MARK: - Turn-in-flight detection (tail semantics, not just mtime quiet)
+
+/// Yields the parsed JSONL lines from the file's last `cap` bytes (first partial line
+/// discarded). Cheap enough to run per grown pair on every scan.
+func tailJSONLLines(path: String, cap: Int = 262_144) -> [[String: Any]] {
+    guard let fh = FileHandle(forReadingAtPath: path) else { return [] }
+    defer { try? fh.close() }
+    let size = (try? fh.seekToEnd()) ?? 0
+    let start = size > UInt64(cap) ? size - UInt64(cap) : 0
+    try? fh.seek(toOffset: start)
+    guard let data = try? fh.readToEnd() else { return [] }
+    var lines = data.split(separator: UInt8(ascii: "\n"))
+    if start > 0, !lines.isEmpty { lines.removeFirst() }      // partial first line
+    return lines.compactMap {
+        try? JSONSerialization.jsonObject(with: Data($0)) as? [String: Any]
+    }
+}
+
+/// Turns older than this are treated as abandoned (interrupted session), not in flight —
+/// otherwise a dead dangling turn would block syncing forever.
+let inFlightStalenessCap: TimeInterval = 600
+
+extension ClaudeIO {
+    /// Is the LAST conversational element an open turn? Open = a user prompt awaiting
+    /// its reply, a tool_result the model is still following up on, or an assistant
+    /// message that called tools whose results haven't landed.
+    static func turnInFlight(path: String, mtime: Date?) -> Bool {
+        if let m = mtime, Date().timeIntervalSince(m) > inFlightStalenessCap { return false }
+        var last: [String: Any]?
+        for dict in tailJSONLLines(path: path) {
+            guard let t = dict["type"] as? String, t == "user" || t == "assistant",
+                  (dict["isSidechain"] as? Bool) != true,
+                  (dict["isMeta"] as? Bool) != true,
+                  dict["message"] != nil else { continue }
+            last = dict
+        }
+        guard let line = last, let message = line["message"] as? [String: Any] else {
+            return false
+        }
+        if (line["type"] as? String) == "assistant" {
+            if let items = message["content"] as? [[String: Any]],
+               items.contains(where: { ($0["type"] as? String) == "tool_use" }) {
+                return true                    // tools called, results not in the tail yet
+            }
+            return false                       // plain assistant reply = turn closed
+        }
+        return true                            // user prompt or tool_result = model's move
+    }
+}
 
 enum ClaudeWriter {
 
