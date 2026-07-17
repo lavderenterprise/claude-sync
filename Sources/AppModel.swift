@@ -7,7 +7,6 @@ import Combine
 @MainActor final class AppModel: ObservableObject {
     @Published var selectedTab: AppTab = .accounts
     let codex = CodexStore()
-    let gate = SyncGate()
 
     private let watcher = SessionWatcher()
     private let debouncer = Debouncer()
@@ -22,10 +21,13 @@ import Combine
 
         // Engine writes land in the watched trees: pause the watcher during any sync
         // and keep it paused through the FSEvents latency window afterwards.
-        codex.willWrite = { [weak self] in self?.watcher.setPaused(true) }
+        // Counted pause with a per-run balance: run A's delayed unpause can no longer
+        // fire while run B is still writing (the old single Bool had exactly that hole).
+        codex.willWrite = { [weak self] in self?.watcher.beginPause() }
         codex.didWrite = { [weak self] in
+            // Keep the pause through the FSEvents latency window before balancing it.
             DispatchQueue.main.asyncAfter(deadline: .now() + 7) {
-                self?.watcher.setPaused(false)
+                self?.watcher.endPause()
             }
         }
 
@@ -57,7 +59,6 @@ import Combine
                 onEvent: { [weak self] path in
                     guard let self else { return }
                     Task {
-                        guard await !self.gate.isSuppressed(path) else { return }
                         guard let key = await self.pairKey(forChangedPath: path) else { return }
                         await self.debouncer.bump(key: key) { k in
                             Task { @MainActor in self.quiescent(k) }
@@ -81,15 +82,19 @@ import Combine
         guard name.hasSuffix(".jsonl") else { return nil }
         let stem = String(name.dropLast(6))
 
-        if path.contains("/.claude/projects/") {
+        // Prefix checks against the ACTUAL roots (CODEX_HOME may relocate ~/.codex).
+        if path.hasPrefix(CLAUDE_HOME.appending(path: "projects").path) {
             guard stem.count == 36 else { return nil }        // subagent/aux files differ
             return stem
         }
-        if path.contains("/.codex/sessions/") {
+        if path.hasPrefix(CodexPaths.sessionsDir.path) {
             guard stem.hasPrefix("rollout-"), stem.count > 36 else { return nil }
             let codexId = String(stem.suffix(36))
             if let store = try? LinkStoreIO.load(),
-               let pair = store.pairs.first(where: { $0.codexThreadId == codexId }) {
+               let pair = store.pairs.first(where: {
+                   $0.codexThreadId == codexId
+                       || ($0.codexSegments ?? []).contains(where: { $0.threadId == codexId }) }) {
+                // A chain child's event belongs to its root's pair — never a new import.
                 return pair.claudeSessionId
             }
             return codexId

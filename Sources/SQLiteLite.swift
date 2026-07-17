@@ -50,8 +50,20 @@ final class SQLiteDB {
         try bind(s, binds)
 
         var rows: [[String: SQLiteValue]] = []
+        var attempts = 0
         while true {
-            let rc = step(s)
+            let rc = sqlite3_step(s)
+            if rc == SQLITE_BUSY || rc == SQLITE_LOCKED {
+                // A reset mid-iteration RESTARTS the result set: already-collected rows
+                // would duplicate (and Dictionary(uniqueKeysWithValues:) traps on dup
+                // ids). Restart the collection from scratch instead.
+                guard attempts < 3 else { throw lastError() }
+                attempts += 1
+                usleep(250_000)
+                sqlite3_reset(s)
+                rows.removeAll()
+                continue
+            }
             if rc == SQLITE_DONE { break }
             guard rc == SQLITE_ROW else { throw lastError() }
             var row: [String: SQLiteValue] = [:]

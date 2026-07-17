@@ -1,49 +1,6 @@
 import Foundation
 import CoreServices
 
-// MARK: - SyncGate: self-event suppression
-// The engine writes into the very trees the watcher watches. Without suppression the
-// app would ping-pong on its own writes. kFSEventStreamCreateFlagIgnoreSelf is the
-// first line but is unreliable with atomic (write-temp + rename) writes, so the gate
-// is the guarantee.
-
-actor SyncGate {
-    private var suppressed: [String: Date] = [:]        // canonical path → expiry
-    private var globalPauseUntil = Date.distantPast
-
-    /// FSEvents delivery can lag by up to the stream latency; tokens therefore expire
-    /// on a timed grace window AFTER the write finishes — never at endWrites itself.
-    private let grace: TimeInterval = 2.0 + 5.0
-
-    func beginWrites(_ paths: [String]) {
-        for p in paths { suppressed[canon(p)] = .distantFuture }
-    }
-
-    func endWrites(_ paths: [String]) {
-        let expiry = Date().addingTimeInterval(grace)
-        for p in paths { suppressed[canon(p)] = expiry }
-    }
-
-    func pauseAll(seconds: TimeInterval) {
-        globalPauseUntil = max(globalPauseUntil, Date().addingTimeInterval(seconds))
-    }
-
-    func isSuppressed(_ path: String) -> Bool {
-        if Date() < globalPauseUntil { return true }
-        let key = canon(path)
-        guard let expiry = suppressed[key] else { return false }
-        if Date() >= expiry {
-            suppressed[key] = nil
-            return false
-        }
-        return true
-    }
-
-    private func canon(_ p: String) -> String {
-        URL(filePath: p).standardizedFileURL.path
-    }
-}
-
 // MARK: - Debouncer: per-pair quiescence timers
 
 actor Debouncer {
@@ -79,7 +36,19 @@ final class SessionWatcher {
     private let queue = DispatchQueue(label: "css.watcher", qos: .utility)
     private var onEvent: (@Sendable (String) -> Void)?
     private var onOverflow: (@Sendable () -> Void)?
-    private var paused = false
+    // Read on the FSEvents queue, written from the main thread: lock-protected —
+    // an unsynchronized Bool here is a data race, and a stale read lets a self-write
+    // event through the pause.
+    private let pausedLock = NSLock()
+    private var _pauseCount = 0
+    var isPausedNow: Bool {
+        pausedLock.lock(); defer { pausedLock.unlock() }
+        return _pauseCount > 0
+    }
+    /// Counted pause: overlapping runs each balance their own begin/end — a single
+    /// Bool let run A's delayed unpause fire mid-run-B.
+    func beginPause() { pausedLock.lock(); _pauseCount += 1; pausedLock.unlock() }
+    func endPause() { pausedLock.lock(); _pauseCount = max(0, _pauseCount - 1); pausedLock.unlock() }
 
     var isRunning: Bool { stream != nil }
 
@@ -96,7 +65,7 @@ final class SessionWatcher {
         let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
             guard let info else { return }
             let watcher = Unmanaged<SessionWatcher>.fromOpaque(info).takeUnretainedValue()
-            guard !watcher.paused else { return }
+            guard !watcher.isPausedNow else { return }
             guard let pathArray = unsafeBitCast(paths, to: NSArray.self) as? [String] else { return }
             for i in 0..<count {
                 let f = flags[i]
@@ -125,14 +94,14 @@ final class SessionWatcher {
         stream = s
     }
 
-    func setPaused(_ p: Bool) { paused = p }
-
     func stop() {
         guard let s = stream else { return }
         FSEventStreamStop(s)
         FSEventStreamInvalidate(s)
         FSEventStreamRelease(s)
         stream = nil
+        onEvent = nil               // callbacks racing invalidation must find nothing
+        onOverflow = nil
     }
 
     deinit { stop() }

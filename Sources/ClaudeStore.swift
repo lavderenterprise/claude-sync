@@ -93,13 +93,21 @@ func tailJSONLLines(path: String, cap: Int = 262_144) -> [[String: Any]] {
     guard let fh = FileHandle(forReadingAtPath: path) else { return [] }
     defer { try? fh.close() }
     let size = (try? fh.seekToEnd()) ?? 0
-    let start = size > UInt64(cap) ? size - UInt64(cap) : 0
-    try? fh.seek(toOffset: start)
-    guard let data = try? fh.readToEnd() else { return [] }
-    var lines = data.split(separator: UInt8(ascii: "\n"))
-    if start > 0, !lines.isEmpty { lines.removeFirst() }      // partial first line
-    return lines.compactMap {
-        try? JSONSerialization.jsonObject(with: Data($0)) as? [String: Any]
+    var window = cap
+    // A single line larger than the window (huge tool_result) yields zero parseable
+    // lines; widen up to 8× before giving up so in-flight detection stays sighted.
+    while true {
+        let start = size > UInt64(window) ? size - UInt64(window) : 0
+        try? fh.seek(toOffset: start)
+        guard let data = try? fh.readToEnd() else { return [] }
+        var lines = data.split(separator: UInt8(ascii: "\n"))
+        if start > 0, !lines.isEmpty { lines.removeFirst() }      // partial first line
+        let parsed = lines.compactMap {
+            try? JSONSerialization.jsonObject(with: Data($0)) as? [String: Any]
+        }
+        if !parsed.isEmpty || start == 0 { return parsed }
+        if window >= cap * 8 { return parsed }
+        window *= 8
     }
 }
 
@@ -122,7 +130,10 @@ extension ClaudeIO {
             last = dict
         }
         guard let line = last, let message = line["message"] as? [String: Any] else {
-            return false
+            // No conversational line in the tail (huge unparseable line, or pure
+            // bookkeeping): we cannot prove the turn is closed — fail safe. The
+            // staleness cap at the top still releases abandoned files.
+            return true
         }
         if (line["type"] as? String) == "assistant" {
             if let items = message["content"] as? [[String: Any]],
@@ -147,6 +158,13 @@ enum ClaudeWriter {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let final = dir.appending(path: sessionId + ".jsonl")
         let tmp = dir.appending(path: ".tmp-" + sessionId + ".jsonl")
+        // Deterministic ids make re-imports converge on the same path: if a previous
+        // mirror exists (ledger lost/reset), keep a copy before replacing it.
+        if FileManager.default.fileExists(atPath: final.path) {
+            try? FileManager.default.removeItem(atPath: final.path + ".pre-import-bak")
+            try? FileManager.default.copyItem(atPath: final.path,
+                                              toPath: final.path + ".pre-import-bak")
+        }
 
         FileManager.default.createFile(atPath: tmp.path, contents: nil)
         let fh = try FileHandle(forWritingTo: tmp)
@@ -257,8 +275,13 @@ func serializeJSONL(_ lines: [[String: Any]]) -> Data {
     return out
 }
 
+enum AppendError: Error { case targetMoved }
+
 /// .css-bak copy + single append write + fsync. Shared by both sides' appenders.
-func appendJSONL(path: String, data: Data) throws -> (Int64, Int64) {
+/// `expectedEnd` guards against the native writer appending between the caller's size
+/// probe (recorded in the WriteIntent) and this write: a moved end means writing now
+/// would leave the ledger cursor pointing mid-content — abort instead.
+func appendJSONL(path: String, data: Data, expectedEnd: Int64? = nil) throws -> (Int64, Int64) {
     let fm = FileManager.default
     let bak = path + ".css-bak"
     try? fm.removeItem(atPath: bak)
@@ -270,6 +293,9 @@ func appendJSONL(path: String, data: Data) throws -> (Int64, Int64) {
     }
     defer { try? fh.close() }
     let end = try fh.seekToEnd()
+    if let expected = expectedEnd, Int64(end) != expected {
+        throw AppendError.targetMoved
+    }
     try fh.write(contentsOf: data)
     try fh.synchronize()
     return (Int64(data.count), Int64(end) + Int64(data.count))

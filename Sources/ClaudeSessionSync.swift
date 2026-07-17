@@ -358,6 +358,7 @@ func claudeIsRunning() -> Bool {
     }
 
     func sync() {
+        guard !busy else { return }
         busy = true
         Task.detached {
             let r = runSync()

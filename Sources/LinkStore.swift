@@ -121,6 +121,21 @@ enum LinkStoreIO {
     }
 }
 
+/// Advisory cross-process lock serializing every load→mutate→save cycle on the ledger.
+/// The app and external engine processes (harness, future CLI) share the same
+/// codex-links.json; without this, one writer's load→save round-trip can erase the
+/// other's freshly appended pair. NOT reentrant — lock only at outermost entry points.
+func withLedgerLock<T>(_ body: () throws -> T) rethrows -> T {
+    try? FileManager.default.createDirectory(at: LinkStoreIO.dir, withIntermediateDirectories: true)
+    let fd = open(LinkStoreIO.dir.appending(path: ".ledger.lock").path,
+                  O_CREAT | O_RDWR, 0o644)
+    if fd >= 0 { flock(fd, LOCK_EX) }
+    defer {
+        if fd >= 0 { flock(fd, LOCK_UN); close(fd) }
+    }
+    return try body()
+}
+
 func isoNow() -> String {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

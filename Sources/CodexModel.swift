@@ -45,7 +45,7 @@ struct CodexSyncReport: Identifiable {
     var wroteCodexSide = false
     var wroteClaudeSide = false
     var ok: Bool { fatal == nil && failed.isEmpty }
-    var id: String { "\(created)-\(updated)-\(failed.count)-\(backupDir?.path ?? "")" }
+    let id = UUID().uuidString        // instance-unique: equal-count reports must still present
 }
 
 /// User-facing fatal errors — same philosophy as `FatalError`: the text is what the

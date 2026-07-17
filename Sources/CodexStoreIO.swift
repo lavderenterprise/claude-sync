@@ -219,6 +219,12 @@ enum CodexWriter {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let tmp = dir.appending(path: ".tmp-" + url.lastPathComponent)
+        if FileManager.default.fileExists(atPath: url.path) {
+            // Deterministic path: a re-import (ledger lost) would replace a mirror that
+            // may hold native turns — keep a copy first.
+            try? FileManager.default.removeItem(atPath: url.path + ".pre-import-bak")
+            try? FileManager.default.copyItem(atPath: url.path, toPath: url.path + ".pre-import-bak")
+        }
         FileManager.default.createFile(atPath: tmp.path, contents: nil)
         let fh = try FileHandle(forWritingTo: tmp)
         do {
@@ -283,6 +289,11 @@ enum CodexWriter {
         setInt("has_user_event", 1)
         setInt("archived", 0)
         if row.keys.contains("archived_at") { row["archived_at"] = .null }
+        // Never inherit chain links from the template row: a fork-child template would
+        // graft every import into an unrelated chain.
+        for link in ["forked_from_id", "parent_thread_id"] where row.keys.contains(link) {
+            row[link] = .null
+        }
 
         let cols = row.keys.sorted()
         let placeholders = cols.map { _ in "?" }.joined(separator: ",")

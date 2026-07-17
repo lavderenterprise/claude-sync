@@ -194,8 +194,27 @@ final class ClaudeToCodexEmitter {
             return out
         }
 
-        // Assistant content before any user turn is dropped (native behavior).
-        guard currentTurnId != nil else { return [] }
+        // Assistant content with no open turn: on a FULL import this is pre-prompt
+        // noise (native importer drops it too) — but on an incremental region it is
+        // the answer to a previously-synced prompt; dropping it would lose the reply
+        // and advance the cursor past it. Open a synthetic continuation turn.
+        if currentTurnId == nil {
+            guard turnIndex > 0 else { return [] }  // full import from zero: keep native behavior
+            turnIndex += 1
+            let tid = "external-import-turn-\(turnIndex)"
+            currentTurnId = tid
+            currentTurnStartedAt = tsSecs
+            var out: [[String: Any]] = [["timestamp": ts, "type": "event_msg",
+                "payload": ["type": "task_started", "turn_id": tid,
+                            "started_at": tsSecs as Any? ?? NSNull()]]]
+            responseBytes += extracted.text.utf8.count
+            out.append(["timestamp": ts, "type": "event_msg",
+                        "payload": ["type": "agent_message", "message": extracted.text]])
+            out.append(["timestamp": ts, "type": "response_item",
+                        "payload": ["type": "message", "role": "assistant",
+                                    "content": [["type": "output_text", "text": extracted.text]]]])
+            return out
+        }
         responseBytes += extracted.text.utf8.count
         return [
             ["timestamp": ts, "type": "event_msg",
@@ -308,24 +327,31 @@ final class CodexToClaudeEmitter {
     private(set) var stats = Stats()
 
     // Replay dedup for fork chains: a continuation segment may replay the parent's
-    // history before the new turns. While `dedupActive`, user turns whose text was
-    // already emitted in this chain are skipped (with everything up to the next user
-    // turn); the first genuinely new user turn switches emission back on for good.
-    private var emittedUserHashes: Set<Int> = []
+    // history before the new turns. Matching is ORDERED and prefix-only: the replay
+    // candidate must equal the next expected turn in the already-emitted sequence —
+    // a set-based match would swallow legitimate repeats ("ok", "continue") anywhere.
+    // Hashes are whitespace-normalized: replayed copies join blocks differently.
+    private var emittedUserSequence: [Int] = []
     private var dedupActive = false
+    private var replayCursor = 0
     private var skippingReplayedTurn = false
+
+    static func normalizedHash(_ text: String) -> Int {
+        text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").hashValue
+    }
 
     /// Call at the start of each chain segment. `dedupReplay` is true for fork
     /// children being consumed from the beginning.
     func beginSegment(dedupReplay: Bool) {
         dedupActive = dedupReplay
+        replayCursor = 0
         skippingReplayedTurn = false
     }
 
-    /// Seeds the replay dedup with user turns already present on the Claude side
-    /// (needed when an incremental sync starts consuming a fresh fork child).
-    func seedEmittedUserHashes(_ hashes: Set<Int>) {
-        emittedUserHashes.formUnion(hashes)
+    /// Seeds the replay dedup with the ORDERED user turns already present on the
+    /// Claude side (incremental sync consuming a fresh fork child).
+    func seedEmittedUserSequence(_ hashes: [Int]) {
+        emittedUserSequence = hashes + emittedUserSequence
     }
 
     /// Codex-injected control payloads that must not bounce between the apps.
@@ -362,14 +388,18 @@ final class CodexToClaudeEmitter {
             guard line.payloadType == "user_message",
                   let text = line.payload["message"] as? String, !text.isEmpty,
                   !isControl(text) else { return [] }
-            let h = text.hashValue
-            if dedupActive, emittedUserHashes.contains(h) {
-                skippingReplayedTurn = true         // replayed prefix: swallow the turn
-                return []
+            let h = Self.normalizedHash(text)
+            if dedupActive {
+                if replayCursor < emittedUserSequence.count,
+                   emittedUserSequence[replayCursor] == h {
+                    replayCursor += 1               // matches the expected replayed turn
+                    skippingReplayedTurn = true
+                    return []
+                }
+                dedupActive = false                 // sequence diverged: replay is over
             }
-            dedupActive = false                     // first new turn ends the replay prefix
             skippingReplayedTurn = false
-            emittedUserHashes.insert(h)
+            emittedUserSequence.append(h)
             // A user turn interrupts any in-flight tool call: settle pairs first.
             var out = flushPendingCalls(ts: ts)
             out.append(emit("user", ["role": "user", "content": text], ts: ts))

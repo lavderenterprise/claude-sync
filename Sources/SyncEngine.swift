@@ -14,6 +14,11 @@ final class CodexEngine {
     /// Builds the pair table. Read-only except for persisting freshly computed pair
     /// states back into the ledger (so the menu bar badge survives restarts).
     func scan() -> ScanResult {
+        withLedgerLock { scanInner() }
+    }
+
+    /// Ledger-lock-free core; callers must hold the ledger lock.
+    func scanInner() -> ScanResult {
         var result = ScanResult()
 
         guard CodexPaths.isInstalled else {
@@ -114,7 +119,8 @@ final class CodexEngine {
         for (id, s) in claudeById where !pairedClaude.contains(id) {
             rows.append(unlinkedClaudeRow(s))
         }
-        for (id, t) in codexById where !pairedCodex.contains(id) && !childIds.contains(id) {
+        for (id, t) in codexById where !pairedCodex.contains(id) && !childIds.contains(id)
+                                        && !t.archived {
             // Chain roots represent the whole chat; children never get their own row.
             let leafActivity = chains[id]?.leaf.updatedAtMs ?? t.updatedAtMs
             rows.append(PairRow(
@@ -143,12 +149,28 @@ final class CodexEngine {
         var dirty = false
         for i in store.pairs.indices {
             let rec = store.pairs[i]
-            guard !fm.fileExists(atPath: rec.codexRolloutPath),
-                  let t = codexById[rec.codexThreadId],
-                  t.rolloutPath != rec.codexRolloutPath,
-                  fm.fileExists(atPath: t.rolloutPath) else { continue }
-            store.pairs[i].codexRolloutPath = t.rolloutPath
-            dirty = true
+            if !fm.fileExists(atPath: rec.codexRolloutPath),
+               let t = codexById[rec.codexThreadId],
+               t.rolloutPath != rec.codexRolloutPath,
+               fm.fileExists(atPath: t.rolloutPath) {
+                store.pairs[i].codexRolloutPath = t.rolloutPath
+                dirty = true
+            }
+            // Chain segments move on archive exactly like roots do.
+            if var segs = store.pairs[i].codexSegments {
+                var segDirty = false
+                for si in segs.indices where !fm.fileExists(atPath: segs[si].rolloutPath) {
+                    guard let t = codexById[segs[si].threadId],
+                          t.rolloutPath != segs[si].rolloutPath,
+                          fm.fileExists(atPath: t.rolloutPath) else { continue }
+                    segs[si].rolloutPath = t.rolloutPath
+                    segDirty = true
+                }
+                if segDirty {
+                    store.pairs[i].codexSegments = segs
+                    dirty = true
+                }
+            }
         }
         return dirty
     }
@@ -360,6 +382,17 @@ extension CodexEngine {
                 issues.append(.init(pairTitle: title, side: "ledger",
                                     detail: "unrecovered in-flight write intent"))
             }
+            for seg in rec.codexSegments ?? [] {
+                guard let size = (try? fm.attributesOfItem(atPath: seg.rolloutPath))?[.size] as? Int64 else {
+                    issues.append(.init(pairTitle: title, side: "codex",
+                                        detail: "chain segment rollout missing on disk"))
+                    continue
+                }
+                if size < seg.cursor.byteOffset {
+                    issues.append(.init(pairTitle: title, side: "ledger",
+                                        detail: "segment cursor beyond file size (rewritten?)"))
+                }
+            }
 
             // Claude transcript: uuid chain + tool_use/tool_result pairing.
             // Calibrated against native reality: compaction legitimately prunes chain
@@ -445,6 +478,12 @@ extension CodexEngine {
         }
         return issues
     }
+}
+
+func isoFractional(_ s: String) -> Date? {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f.date(from: s)
 }
 
 // MARK: - Backups (one set per writing run; sqlite via the Online Backup API)
@@ -540,13 +579,42 @@ extension CodexEngine {
                 store.pairs[i].inFlight = nil
                 dirty = true
             }
-            // Anything else: partial write — stays flagged; scan reports it as conflict.
+            else if let started = ISO8601DateFormatter().date(from: intent.startedAt)
+                        ?? isoFractional(intent.startedAt),
+                    Date().timeIntervalSince(started) > 3600 {
+                // Stale partial write (crash mid-append over an hour ago, region never
+                // matched): without an escape the pair loops in "interrupted write"
+                // forever. Re-baseline: cursors to live sizes, the ambiguous region
+                // recorded as skipped — bytes stay in the file, nothing is mirrored.
+                let fm = FileManager.default
+                if let size = (try? fm.attributesOfItem(atPath: intent.targetPath))?[.size] as? Int64 {
+                    store.pairs[i].skipped.append(SkippedRange(
+                        side: intent.targetSide, reason: "stale-interrupted-write",
+                        at: isoNow(), fromByte: intent.baseOffset, toByte: size))
+                    if intent.targetSide == "claude" {
+                        store.pairs[i].claude.byteOffset = size
+                    } else if intent.targetPath == store.pairs[i].codexRolloutPath {
+                        store.pairs[i].codex.byteOffset = size
+                    } else if var segs = store.pairs[i].codexSegments,
+                              let si = segs.firstIndex(where: { $0.rolloutPath == intent.targetPath }) {
+                        segs[si].cursor.byteOffset = size
+                        store.pairs[i].codexSegments = segs
+                    }
+                    store.pairs[i].inFlight = nil
+                    dirty = true
+                }
+            }
+            // Fresh partial writes stay flagged; scan reports them as conflict.
         }
         return dirty
     }
 
     /// Entry point for a single row (manual Sync / Import buttons; M4 loops over this).
     func syncRow(id: String) -> CodexSyncReport {
+        withLedgerLock { syncRowInner(id: id) }
+    }
+
+    private func syncRowInner(id: String) -> CodexSyncReport {
         var report = CodexSyncReport()
         do {
             var store = try LinkStoreIO.load()
@@ -559,12 +627,25 @@ extension CodexEngine {
             report.backupDir = try BackupManager.runBackup()
 
             if let idx = store.pairs.firstIndex(where: {
-                $0.claudeSessionId == id || $0.codexThreadId == id }) {
+                $0.claudeSessionId == id || $0.codexThreadId == id
+                    || ($0.codexSegments ?? []).contains(where: { $0.threadId == id }) }) {
                 try syncPair(at: idx, store: &store, report: &report)
             } else if let claude = ClaudeIO.enumerateSessions().first(where: { $0.cliSessionId == id }) {
                 try importClaude(claude, store: &store, report: &report)
             } else if let codex = CodexIO.enumerateThreads().first(where: { $0.id == id }) {
-                try importCodex(codex, store: &store, report: &report)
+                // Never import a chain CHILD as a standalone chat: resolve to its root.
+                let chains = buildChains(Dictionary(uniqueKeysWithValues:
+                    CodexIO.enumerateThreads().map { ($0.id, $0) }))
+                if chains[codex.id] == nil,
+                   let rootId = chains.first(where: { $0.value.children.contains { $0.id == codex.id } })?.key {
+                    if let idx = store.pairs.firstIndex(where: { $0.codexThreadId == rootId }) {
+                        try syncPair(at: idx, store: &store, report: &report)
+                    } else if let root = CodexIO.enumerateThreads().first(where: { $0.id == rootId }) {
+                        try importCodex(root, store: &store, report: &report)
+                    }
+                } else {
+                    try importCodex(codex, store: &store, report: &report)
+                }
             } else {
                 throw EngineError.rowNotFound
             }
@@ -596,12 +677,17 @@ extension CodexEngine {
     /// pending pairs. Conflicts are counted, never auto-resolved. One backup per run;
     /// the ledger commit after each pair is the checkpoint that makes interruption safe.
     func syncAll(progress: @escaping (BulkProgress) -> Void) -> CodexSyncReport {
+        withLedgerLock { syncAllInner(progress: progress) }
+    }
+
+    private func syncAllInner(progress: @escaping (BulkProgress) -> Void) -> CodexSyncReport {
         var report = CodexSyncReport()
         do {
+            // Scan FIRST: it persists recover/heal/attach repairs. Loading before it
+            // (as this code once did) meant iterating a stale snapshot and saving it
+            // back per pair — silently reverting every repair the scan just made.
+            let rows = scanInner().rows
             var store = try LinkStoreIO.load()
-            if recover(&store) { try LinkStoreIO.save(store) }
-
-            let rows = scan().rows
             let actionable = rows.filter {
                 $0.isPending || $0.state == .unlinkedClaude || $0.state == .unlinkedCodex
             }
@@ -665,13 +751,36 @@ extension CodexEngine {
     /// The chosen side's new region is mirrored; the losing side's new region stays in
     /// its own transcript but is recorded as skipped and never mirrored.
     func resolve(id: String, winner: SyncDirection) -> CodexSyncReport {
+        withLedgerLock { resolveInner(id: id, winner: winner) }
+    }
+
+    private func resolveInner(id: String, winner: SyncDirection) -> CodexSyncReport {
         var report = CodexSyncReport()
         do {
             var store = try LinkStoreIO.load()
             if recover(&store) { try LinkStoreIO.save(store) }
+            let codexById = Dictionary(uniqueKeysWithValues:
+                CodexIO.enumerateThreads().map { ($0.id, $0) })
+            if healRolloutPaths(&store, codexById: codexById) { try LinkStoreIO.save(store) }
+            if attachNewSegments(&store, codexById: codexById) { try LinkStoreIO.save(store) }
             guard let idx = store.pairs.firstIndex(where: {
                 $0.claudeSessionId == id || $0.codexThreadId == id }) else {
                 throw EngineError.rowNotFound
+            }
+            if store.pairs[idx].inFlight != nil { throw EngineError.interruptedWrite }
+            // Revalidate against live disk state: the sheet's snapshot may be stale
+            // (another run advanced or resolved this pair while it was open). A blind
+            // fast-forward here would swallow legitimate new turns into skipped ranges.
+            do {
+                let rec0 = store.pairs[idx]
+                let cs = (try? FileManager.default.attributesOfItem(
+                    atPath: rec0.claudeTranscriptPath))?[.size] as? Int64 ?? 0
+                let h = chainHealth(rec0)
+                let claudeGrew0 = cs > rec0.claude.byteOffset
+                guard claudeGrew0 && h.grew else {
+                    throw EngineError.conflictNeedsResolve(
+                        "no longer in conflict — refresh and retry")
+                }
             }
             report.backupDir = try BackupManager.runBackup()
 
@@ -682,12 +791,26 @@ extension CodexEngine {
 
             switch winner {
             case .toCodex:
-                // Loser = Codex's foreign tail: record and fast-forward past it.
+                // Loser = Codex's foreign tail: record and fast-forward past it —
+                // on the root AND on every chain segment, or the skipped content
+                // would sync (duplicate) on the next pass.
                 if codexSize > rec.codex.byteOffset {
                     rec.skipped.append(SkippedRange(side: "codex", reason: "conflict-resolution",
                                                     at: isoNow(),
                                                     fromByte: rec.codex.byteOffset, toByte: codexSize))
                     rec.codex.byteOffset = codexSize
+                }
+                if var segs = rec.codexSegments {
+                    for si in segs.indices {
+                        let size = (try? fm.attributesOfItem(atPath: segs[si].rolloutPath))?[.size] as? Int64 ?? 0
+                        if size > segs[si].cursor.byteOffset {
+                            rec.skipped.append(SkippedRange(
+                                side: "codex", reason: "conflict-resolution", at: isoNow(),
+                                fromByte: segs[si].cursor.byteOffset, toByte: size))
+                            segs[si].cursor.byteOffset = size
+                        }
+                    }
+                    rec.codexSegments = segs
                 }
                 store.pairs[idx] = rec
                 try incrementalToCodex(at: idx, store: &store, report: &report)
@@ -698,7 +821,9 @@ extension CodexEngine {
                     var lastUuid: String?
                     let consumed = try ClaudeIO.streamLines(path: rec.claudeTranscriptPath,
                                                             from: rec.claude.byteOffset) { line in
-                        if let u = line.uuid { lastUuid = u }
+                        guard !line.isSidechain, line.type == "user" || line.type == "assistant",
+                              let u = line.uuid else { return }
+                        lastUuid = u
                     }
                     rec.skipped.append(SkippedRange(side: "claude", reason: "conflict-resolution",
                                                     at: isoNow(),
@@ -936,8 +1061,11 @@ extension CodexEngine {
                                    lastEventId: emitter.stats.lastConsumedUuid ?? rec.claude.lastEventId)
 
         guard !lines.isEmpty else {
-            // Nothing convertible (system/attachment noise): just advance the cursor.
+            // Nothing convertible (system/attachment noise): just advance the cursor —
+            // including the chain tail, or a later Codex→Claude append would parent
+            // onto a stale uuid and fork the mirrored DAG.
             rec.claude = newClaude
+            if let u = emitter.stats.lastConsumedUuid { rec.claudeChainTail = u }
             rec.state = PairState.synced.rawValue
             rec.lastSyncAt = isoNow()
             store.pairs[idx] = rec
@@ -975,7 +1103,17 @@ extension CodexEngine {
         store.pairs[idx] = rec
         try LinkStoreIO.save(store)                          // intent durable before the write
 
-        _ = try appendJSONL(path: leaf.path, data: data)
+        do {
+            _ = try appendJSONL(path: leaf.path, data: data, expectedEnd: base)
+        } catch AppendError.targetMoved {
+            // The native writer appended between our size probe and the write: writing
+            // now would poison the cursor. Clear the intent, skip this round; the next
+            // quiescence re-reads a settled file.
+            rec.inFlight = nil
+            store.pairs[idx] = rec
+            try LinkStoreIO.save(store)
+            return
+        }
         try? CodexWriter.touchThread(id: leaf.threadId,
                                      updatedAtMs: Int(Date().timeIntervalSince1970 * 1000))
 
@@ -1009,18 +1147,19 @@ extension CodexEngine {
         let segments = rec.codexSegments ?? []
         let anyFreshSegment = segments.contains { $0.cursor.byteOffset == 0 }
         if anyFreshSegment {
-            var hashes = Set<Int>()
+            var ordered: [Int] = []
             _ = try? ClaudeIO.streamLines(path: rec.claudeTranscriptPath) { line in
                 guard line.type == "user", !line.isMeta, !line.isSidechain,
                       let c = line.message?["content"] else { return }
-                if let s = c as? String { hashes.insert(s.hashValue) }
-                else if let items = c as? [[String: Any]] {
+                if let s = c as? String {
+                    ordered.append(CodexToClaudeEmitter.normalizedHash(s))
+                } else if let items = c as? [[String: Any]] {
                     let text = items.filter { ($0["type"] as? String) == "text" }
                         .compactMap { $0["text"] as? String }.joined(separator: "\n")
-                    if !text.isEmpty { hashes.insert(text.hashValue) }
+                    if !text.isEmpty { ordered.append(CodexToClaudeEmitter.normalizedHash(text)) }
                 }
             }
-            emitter.seedEmittedUserHashes(hashes)
+            emitter.seedEmittedUserSequence(ordered)
         }
 
         // Consume root first, then every chain segment in creation order.
@@ -1087,7 +1226,14 @@ extension CodexEngine {
         store.pairs[idx] = rec
         try LinkStoreIO.save(store)
 
-        _ = try appendJSONL(path: rec.claudeTranscriptPath, data: data)
+        do {
+            _ = try appendJSONL(path: rec.claudeTranscriptPath, data: data, expectedEnd: base)
+        } catch AppendError.targetMoved {
+            rec.inFlight = nil
+            store.pairs[idx] = rec
+            try LinkStoreIO.save(store)
+            return
+        }
         ClaudeWriter.touchIndexEntry(cliSessionId: rec.claudeSessionId,
                                      lastActivityAtMs: Int(Date().timeIntervalSince1970 * 1000))
 
