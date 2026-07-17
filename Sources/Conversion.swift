@@ -98,8 +98,12 @@ func epochSeconds(_ iso: String) -> Int? {
 func flattenContent(_ content: Any?) -> String {
     if let s = content as? String { return s }
     if let arr = content as? [[String: Any]] {
-        return arr.compactMap { item in
-            (item["type"] as? String) == "text" ? item["text"] as? String : nil
+        // Newer Codex builds emit typed blocks (`input_text` on custom_tool_call_output,
+        // `output_text` elsewhere) instead of plain `text` — accept every text-bearing kind.
+        return arr.compactMap { item -> String? in
+            guard let t = item["type"] as? String,
+                  t == "text" || t == "input_text" || t == "output_text" else { return nil }
+            return item["text"] as? String
         }.joined(separator: "\n")
     }
     return ""
@@ -426,8 +430,11 @@ final class CodexToClaudeEmitter {
                 let name = (line.payload["name"] as? String) ?? "tool"
                 let cid = (line.payload["call_id"] as? String)
                     ?? DeterministicID.uuidV5("call:\(codexId)#\(index)")
+                // function_call carries `arguments` (JSON string); custom_tool_call
+                // carries `input` (freeform string — the exec script itself).
                 pendingCalls.append((id: cid, name: name,
-                                     input: parseArguments(line.payload["arguments"])))
+                                     input: parseArguments(line.payload["arguments"]
+                                                           ?? line.payload["input"])))
                 return []                          // emitted when its output arrives
 
             case "function_call_output", "custom_tool_call_output":
@@ -503,13 +510,14 @@ final class CodexToClaudeEmitter {
     }
 
     /// Codex stores `arguments` as a JSON string; Claude's tool_use `input` is an object.
+    /// Non-JSON strings (custom_tool_call scripts) keep Codex's own field name: `input`.
     private func parseArguments(_ raw: Any?) -> Any {
         if let s = raw as? String {
             if let data = s.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) {
                 return obj
             }
-            return ["raw": s]
+            return ["input": s]
         }
         return raw ?? [:]
     }
