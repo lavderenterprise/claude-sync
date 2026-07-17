@@ -36,6 +36,7 @@ struct WriteIntent: Codable {
     var postChainTail: String?
     var postTurnIndex: Int
     var postEmitIndex: Int
+    var postSegments: [ChainSegment]?     // fork-chain cursors (nil on v1 intents)
 }
 
 struct PairRecord: Codable {
@@ -56,6 +57,17 @@ struct PairRecord: Codable {
     var claudeEmitIndex: Int          // deterministic line-uuid counter (Codex → Claude)
     var skipped: [SkippedRange]
     var inFlight: WriteIntent?
+    /// Fork/continuation segments of the same logical chat (newer Codex builds link
+    /// threads via forked_from_id/parent_thread_id and the UI stitches them into one).
+    /// Ordered by creation; each keeps its own consumption cursor. Optional so v1
+    /// ledgers keep decoding untouched.
+    var codexSegments: [ChainSegment]?
+}
+
+struct ChainSegment: Codable {
+    var threadId: String
+    var rolloutPath: String
+    var cursor: SideCursor
 }
 
 struct LinkStoreFile: Codable {

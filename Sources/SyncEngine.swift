@@ -44,6 +44,11 @@ final class CodexEngine {
 
         if healRolloutPaths(&store, codexById: codexById) { try? LinkStoreIO.save(store) }
 
+        let chains = buildChains(codexById)
+        // Every thread that is a chain CHILD of some root: never shown as its own row.
+        let childIds: Set<String> = Set(chains.values.flatMap { $0.children.map(\.id) })
+        if attachNewSegments(&store, codexById: codexById) { try? LinkStoreIO.save(store) }
+
         let fm = FileManager.default
         var rows: [PairRow] = []
         var dirty = false
@@ -54,11 +59,10 @@ final class CodexEngine {
             let codex = codexById[rec.codexThreadId]
 
             let claudeAttrs = try? fm.attributesOfItem(atPath: rec.claudeTranscriptPath)
-            let codexAttrs = try? fm.attributesOfItem(atPath: rec.codexRolloutPath)
             let claudeSize = claudeAttrs?[.size] as? Int64
-            let codexSize = codexAttrs?[.size] as? Int64
+            let health = chainHealth(rec)
 
-            var (state, reason) = pairState(rec: rec, claudeSize: claudeSize, codexSize: codexSize)
+            var (state, reason) = pairState(rec: rec, claudeSize: claudeSize, codex: health)
 
             // A grown side that is still mid-turn must not read as "to sync" (or as a
             // conflict). Two signals, both required to be quiet: recent writes (the
@@ -71,14 +75,15 @@ final class CodexEngine {
                     guard let m = attrs?[.modificationDate] as? Date else { return false }
                     return Date().timeIntervalSince(m) < quiet
                 }
+                let leaf = leafSegment(rec)
+                let leafAttrs = try? fm.attributesOfItem(atPath: leaf.path)
                 let claudeGrew = (claudeSize ?? 0) > rec.claude.byteOffset
-                let codexGrew = (codexSize ?? 0) > rec.codex.byteOffset
                 let claudeBusy = claudeGrew && (isHot(claudeAttrs)
                     || ClaudeIO.turnInFlight(path: rec.claudeTranscriptPath,
                                              mtime: claudeAttrs?[.modificationDate] as? Date))
-                let codexBusy = codexGrew && (isHot(codexAttrs)
-                    || CodexIO.turnInFlight(path: rec.codexRolloutPath,
-                                            mtime: codexAttrs?[.modificationDate] as? Date))
+                let codexBusy = health.grew && (isHot(leafAttrs)
+                    || CodexIO.turnInFlight(path: leaf.path,
+                                            mtime: leafAttrs?[.modificationDate] as? Date))
                 if claudeBusy || codexBusy {
                     state = .working
                     reason = nil
@@ -109,12 +114,14 @@ final class CodexEngine {
         for (id, s) in claudeById where !pairedClaude.contains(id) {
             rows.append(unlinkedClaudeRow(s))
         }
-        for (id, t) in codexById where !pairedCodex.contains(id) {
+        for (id, t) in codexById where !pairedCodex.contains(id) && !childIds.contains(id) {
+            // Chain roots represent the whole chat; children never get their own row.
+            let leafActivity = chains[id]?.leaf.updatedAtMs ?? t.updatedAtMs
             rows.append(PairRow(
                 id: id, claudeID: nil, codexID: id,
                 title: t.title, cwd: t.cwd,
                 state: .unlinkedCodex,
-                claudeLastActivity: 0, codexLastActivity: t.updatedAtMs,
+                claudeLastActivity: 0, codexLastActivity: max(t.updatedAtMs, leafActivity),
                 conflictReason: nil))
         }
 
@@ -147,17 +154,17 @@ final class CodexEngine {
     }
 
     /// Cursor-vs-size state machine. Shrunk file = rewritten history (compaction etc.):
-    /// never blind-append, surface as conflict for a manual re-baseline.
-    private func pairState(rec: PairRecord, claudeSize: Int64?, codexSize: Int64?)
+    /// never blind-append, surface as conflict for a manual re-baseline. Codex side is
+    /// evaluated across the whole fork chain.
+    private func pairState(rec: PairRecord, claudeSize: Int64?, codex: ChainHealth)
         -> (PairState, String?) {
         guard let cs = claudeSize else { return (.conflict, "Claude transcript missing") }
-        guard let xs = codexSize else { return (.conflict, "Codex rollout missing") }
+        if codex.missing { return (.conflict, "Codex rollout missing") }
         if rec.inFlight != nil { return (.conflict, "interrupted write — needs recovery") }
         if cs < rec.claude.byteOffset { return (.conflict, "Claude transcript was rewritten") }
-        if xs < rec.codex.byteOffset { return (.conflict, "Codex rollout was rewritten") }
+        if codex.shrunk { return (.conflict, "Codex rollout was rewritten") }
         let claudeGrew = cs > rec.claude.byteOffset
-        let codexGrew = xs > rec.codex.byteOffset
-        switch (claudeGrew, codexGrew) {
+        switch (claudeGrew, codex.grew) {
         case (true, true): return (.conflict, "both sides advanced since last sync")
         case (true, false): return (.pendingToCodex, nil)
         case (false, true): return (.pendingToClaude, nil)
@@ -171,6 +178,86 @@ final class CodexEngine {
                 state: .unlinkedClaude,
                 claudeLastActivity: s.lastActivityAt, codexLastActivity: 0,
                 conflictReason: nil)
+    }
+}
+
+// MARK: - Fork chains (newer Codex builds link continuation threads)
+
+/// One logical chat = a chain of threads linked by forked_from_id/parent_thread_id.
+/// The ChatGPT UI stitches them; importing each segment as its own Claude session is
+/// exactly the bug this solves.
+struct ChainView {
+    let root: CodexThreadInfo
+    let children: [CodexThreadInfo]           // ordered by createdAtMs
+    var leaf: CodexThreadInfo { children.last ?? root }
+}
+
+extension CodexEngine {
+    /// rootId → chain. Threads without links are single-segment chains. Cycle-safe.
+    func buildChains(_ byId: [String: CodexThreadInfo]) -> [String: ChainView] {
+        func rootOf(_ id: String) -> String {
+            var cur = id, hops = 0
+            while hops < 64, let p = byId[cur]?.parentId, byId[p] != nil, p != cur {
+                cur = p; hops += 1
+            }
+            return cur
+        }
+        var childrenByRoot: [String: [CodexThreadInfo]] = [:]
+        for (id, t) in byId where rootOf(id) != id {
+            childrenByRoot[rootOf(id), default: []].append(t)
+        }
+        var out: [String: ChainView] = [:]
+        for (id, t) in byId where rootOf(id) == id {
+            let kids = (childrenByRoot[id] ?? []).sorted { $0.createdAtMs < $1.createdAtMs }
+            out[id] = ChainView(root: t, children: kids)
+        }
+        return out
+    }
+
+    /// Health of the pair's codex side across root + every chain segment.
+    struct ChainHealth { var missing = false; var shrunk = false; var grew = false }
+
+    func chainHealth(_ rec: PairRecord) -> ChainHealth {
+        let fm = FileManager.default
+        var h = ChainHealth()
+        func check(_ path: String, _ cursor: SideCursor) {
+            guard let size = (try? fm.attributesOfItem(atPath: path))?[.size] as? Int64 else {
+                h.missing = true
+                return
+            }
+            if size < cursor.byteOffset { h.shrunk = true }
+            if size > cursor.byteOffset { h.grew = true }
+        }
+        check(rec.codexRolloutPath, rec.codex)
+        for seg in rec.codexSegments ?? [] { check(seg.rolloutPath, seg.cursor) }
+        return h
+    }
+
+    /// Attach chain children that appeared since the pair was created. Used by scan
+    /// AND syncRow — an auto-sync triggered straight by the watcher must see fresh
+    /// fork segments even when no scan ran in between.
+    func attachNewSegments(_ store: inout LinkStoreFile,
+                           codexById: [String: CodexThreadInfo]) -> Bool {
+        let chains = buildChains(codexById)
+        var dirty = false
+        for i in store.pairs.indices {
+            guard let chain = chains[store.pairs[i].codexThreadId] else { continue }
+            let known = Set((store.pairs[i].codexSegments ?? []).map(\.threadId))
+            for kid in chain.children where !known.contains(kid.id) {
+                var segs = store.pairs[i].codexSegments ?? []
+                segs.append(ChainSegment(threadId: kid.id, rolloutPath: kid.rolloutPath,
+                                         cursor: .zero))
+                store.pairs[i].codexSegments = segs
+                dirty = true
+            }
+        }
+        return dirty
+    }
+
+    /// The file where a Claude→Codex append belongs: the chain's active leaf.
+    func leafSegment(_ rec: PairRecord) -> (threadId: String, path: String) {
+        if let seg = rec.codexSegments?.last { return (seg.threadId, seg.rolloutPath) }
+        return (rec.codexThreadId, rec.codexRolloutPath)
     }
 }
 
@@ -444,6 +531,7 @@ extension CodexEngine {
                 store.pairs[i].claudeChainTail = intent.postChainTail
                 store.pairs[i].codexTurnIndex = intent.postTurnIndex
                 store.pairs[i].claudeEmitIndex = intent.postEmitIndex
+                if let segs = intent.postSegments { store.pairs[i].codexSegments = segs }
                 store.pairs[i].state = PairState.synced.rawValue
                 store.pairs[i].inFlight = nil
                 dirty = true
@@ -466,6 +554,7 @@ extension CodexEngine {
             let codexById = Dictionary(uniqueKeysWithValues:
                 CodexIO.enumerateThreads().map { ($0.id, $0) })
             if healRolloutPaths(&store, codexById: codexById) { try LinkStoreIO.save(store) }
+            if attachNewSegments(&store, codexById: codexById) { try LinkStoreIO.save(store) }
 
             report.backupDir = try BackupManager.runBackup()
 
@@ -698,7 +787,8 @@ extension CodexEngine {
             codexTurnIndex: emitter.nextTurnIndex,
             claudeEmitIndex: 0,
             skipped: [],
-            inFlight: nil))
+            inFlight: nil,
+            codexSegments: nil))
         report.created += 1
     }
 
@@ -712,10 +802,18 @@ extension CodexEngine {
                                            cwd: cwd, model: t.model,
                                            chainTail: nil, startLineIndex: 0)
 
+        // The whole fork chain (root + continuation segments) becomes ONE session —
+        // exactly how the ChatGPT UI presents it.
+        let chain = buildChains(Dictionary(uniqueKeysWithValues:
+            CodexIO.enumerateThreads().map { ($0.id, $0) }))[t.id]
+        let children = chain?.children ?? []
+
         var consumed: Int64 = 0
+        var segments: [ChainSegment] = []
         var claudeLineCount = 0
         let transcriptPath = try ClaudeWriter.createTranscript(sessionId: claudeId, cwd: cwd) { write in
             var pendingError: Error?
+            emitter.beginSegment(dedupReplay: false)
             consumed = try CodexIO.streamLines(path: t.rolloutPath) { line in
                 guard pendingError == nil else { return }
                 let out = emitter.feed(line)
@@ -725,6 +823,22 @@ extension CodexEngine {
                 }
             }
             if let e = pendingError { throw e }
+            for kid in children {
+                emitter.beginSegment(dedupReplay: true)     // children may replay history
+                let segConsumed = try CodexIO.streamLines(path: kid.rolloutPath) { line in
+                    guard pendingError == nil else { return }
+                    let out = emitter.feed(line)
+                    if !out.isEmpty {
+                        do { try write(out); claudeLineCount += out.count }
+                        catch { pendingError = error }
+                    }
+                }
+                if let e = pendingError { throw e }
+                segments.append(ChainSegment(
+                    threadId: kid.id, rolloutPath: kid.rolloutPath,
+                    cursor: SideCursor(byteOffset: segConsumed, lineCount: 0,
+                                       lastEventId: emitter.stats.lastTimestamp)))
+            }
             let tail = emitter.finish()             // settle any dangling tool calls
             if !tail.isEmpty {
                 try write(tail)
@@ -761,7 +875,8 @@ extension CodexEngine {
             codexTurnIndex: 0,
             claudeEmitIndex: emitter.nextLineIndex,
             skipped: [],
-            inFlight: nil))
+            inFlight: nil,
+            codexSegments: segments.isEmpty ? nil : segments))
         report.wroteClaudeSide = true
         report.created += 1
     }
@@ -775,11 +890,10 @@ extension CodexEngine {
 
         let fm = FileManager.default
         let claudeSize = (try? fm.attributesOfItem(atPath: rec.claudeTranscriptPath))?[.size] as? Int64 ?? -1
-        let codexSize = (try? fm.attributesOfItem(atPath: rec.codexRolloutPath))?[.size] as? Int64 ?? -1
         let claudeGrew = claudeSize > rec.claude.byteOffset
-        let codexGrew = codexSize > rec.codex.byteOffset
+        let health = chainHealth(rec)
 
-        if claudeSize < rec.claude.byteOffset || codexSize < rec.codex.byteOffset {
+        if claudeSize < rec.claude.byteOffset || health.shrunk {
             throw EngineError.conflictNeedsResolve("a side was rewritten")
         }
         // Never convert an open turn: a long tool keeps the file quiet past the
@@ -788,15 +902,15 @@ extension CodexEngine {
         let fmDate: (String) -> Date? = {
             (try? fm.attributesOfItem(atPath: $0))?[.modificationDate] as? Date
         }
-        switch (claudeGrew, codexGrew) {
+        switch (claudeGrew, health.grew) {
         case (true, true): throw EngineError.conflictNeedsResolve("both sides advanced")
         case (true, false):
             guard !ClaudeIO.turnInFlight(path: rec.claudeTranscriptPath,
                                          mtime: fmDate(rec.claudeTranscriptPath)) else { return }
             try incrementalToCodex(at: idx, store: &store, report: &report)
         case (false, true):
-            guard !CodexIO.turnInFlight(path: rec.codexRolloutPath,
-                                        mtime: fmDate(rec.codexRolloutPath)) else { return }
+            let leaf = leafSegment(rec)
+            guard !CodexIO.turnInFlight(path: leaf.path, mtime: fmDate(leaf.path)) else { return }
             try incrementalToClaude(at: idx, store: &store, report: &report)
         case (false, false): break                          // already in sync
         }
@@ -831,29 +945,45 @@ extension CodexEngine {
         }
 
         let data = serializeJSONL(lines)
-        let base = (try? FileManager.default.attributesOfItem(atPath: rec.codexRolloutPath))?[.size] as? Int64 ?? 0
+        // Claude→Codex appends land on the chain's active LEAF — that is the thread
+        // the ChatGPT UI shows as "the" conversation.
+        let leaf = leafSegment(rec)
+        let base = (try? FileManager.default.attributesOfItem(atPath: leaf.path))?[.size] as? Int64 ?? 0
+        var postCodex = rec.codex
+        var postSegments = rec.codexSegments
+        if leaf.threadId == rec.codexThreadId {
+            postCodex = SideCursor(byteOffset: base + Int64(data.count),
+                                   lineCount: rec.codex.lineCount + lines.count,
+                                   lastEventId: emitter.stats.lastTimestamp)
+        } else if var segs = postSegments,
+                  let li = segs.firstIndex(where: { $0.threadId == leaf.threadId }) {
+            segs[li].cursor = SideCursor(byteOffset: base + Int64(data.count),
+                                         lineCount: segs[li].cursor.lineCount + lines.count,
+                                         lastEventId: emitter.stats.lastTimestamp)
+            postSegments = segs
+        }
         rec.inFlight = WriteIntent(
-            targetSide: "codex", targetPath: rec.codexRolloutPath,
+            targetSide: "codex", targetPath: leaf.path,
             baseOffset: base, length: Int64(data.count),
             payloadSHA256: sha256Hex(data), startedAt: isoNow(),
             postClaude: newClaude,
-            postCodex: SideCursor(byteOffset: base + Int64(data.count),
-                                  lineCount: rec.codex.lineCount + lines.count,
-                                  lastEventId: emitter.stats.lastTimestamp),
+            postCodex: postCodex,
             postChainTail: emitter.stats.lastConsumedUuid ?? rec.claudeChainTail,
             postTurnIndex: emitter.nextTurnIndex,
-            postEmitIndex: rec.claudeEmitIndex)
+            postEmitIndex: rec.claudeEmitIndex,
+            postSegments: postSegments)
         store.pairs[idx] = rec
         try LinkStoreIO.save(store)                          // intent durable before the write
 
-        _ = try appendJSONL(path: rec.codexRolloutPath, data: data)
-        try? CodexWriter.touchThread(id: rec.codexThreadId,
+        _ = try appendJSONL(path: leaf.path, data: data)
+        try? CodexWriter.touchThread(id: leaf.threadId,
                                      updatedAtMs: Int(Date().timeIntervalSince1970 * 1000))
 
         rec.claude = rec.inFlight!.postClaude
         rec.codex = rec.inFlight!.postCodex
         rec.claudeChainTail = rec.inFlight!.postChainTail
         rec.codexTurnIndex = rec.inFlight!.postTurnIndex
+        if let segs = rec.inFlight!.postSegments { rec.codexSegments = segs }
         rec.inFlight = nil
         rec.state = PairState.synced.rawValue
         rec.lastSyncAt = isoNow()
@@ -865,6 +995,7 @@ extension CodexEngine {
     func incrementalToClaude(at idx: Int, store: inout LinkStoreFile,
                              report: inout CodexSyncReport) throws {
         var rec = store.pairs[idx]
+        let fm = FileManager.default
         let model = CodexIO.enumerateThreads().first { $0.id == rec.codexThreadId }?.model
             ?? "codex-import"
         let emitter = CodexToClaudeEmitter(claudeSessionId: rec.claudeSessionId,
@@ -872,11 +1003,57 @@ extension CodexEngine {
                                            cwd: rec.cwd, model: model,
                                            chainTail: rec.claudeChainTail,
                                            startLineIndex: rec.claudeEmitIndex)
-        var lines: [[String: Any]] = []
-        let consumed = try CodexIO.streamLines(path: rec.codexRolloutPath,
-                                               from: rec.codex.byteOffset) { line in
-            lines.append(contentsOf: emitter.feed(line))
+
+        // Fork children starting from zero may replay the parent's history: seed the
+        // dedup with the user turns already present in the Claude transcript.
+        let segments = rec.codexSegments ?? []
+        let anyFreshSegment = segments.contains { $0.cursor.byteOffset == 0 }
+        if anyFreshSegment {
+            var hashes = Set<Int>()
+            _ = try? ClaudeIO.streamLines(path: rec.claudeTranscriptPath) { line in
+                guard line.type == "user", !line.isMeta, !line.isSidechain,
+                      let c = line.message?["content"] else { return }
+                if let s = c as? String { hashes.insert(s.hashValue) }
+                else if let items = c as? [[String: Any]] {
+                    let text = items.filter { ($0["type"] as? String) == "text" }
+                        .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                    if !text.isEmpty { hashes.insert(text.hashValue) }
+                }
+            }
+            emitter.seedEmittedUserHashes(hashes)
         }
+
+        // Consume root first, then every chain segment in creation order.
+        var lines: [[String: Any]] = []
+        var newCodex = rec.codex
+        let rootSize = (try? fm.attributesOfItem(atPath: rec.codexRolloutPath))?[.size] as? Int64 ?? 0
+        if rootSize > rec.codex.byteOffset {
+            emitter.beginSegment(dedupReplay: false)
+            let consumed = try CodexIO.streamLines(path: rec.codexRolloutPath,
+                                                   from: rec.codex.byteOffset) { line in
+                lines.append(contentsOf: emitter.feed(line))
+            }
+            newCodex = SideCursor(byteOffset: consumed,
+                                  lineCount: rec.codex.lineCount + emitter.stats.consumedLineCount,
+                                  lastEventId: emitter.stats.lastTimestamp)
+        }
+        var newSegments = segments
+        for si in segments.indices {
+            let seg = segments[si]
+            let size = (try? fm.attributesOfItem(atPath: seg.rolloutPath))?[.size] as? Int64 ?? 0
+            guard size > seg.cursor.byteOffset else { continue }
+            emitter.beginSegment(dedupReplay: seg.cursor.byteOffset == 0)
+            let before = emitter.stats.consumedLineCount
+            let consumed = try CodexIO.streamLines(path: seg.rolloutPath,
+                                                   from: seg.cursor.byteOffset) { line in
+                lines.append(contentsOf: emitter.feed(line))
+            }
+            newSegments[si].cursor = SideCursor(
+                byteOffset: consumed,
+                lineCount: seg.cursor.lineCount + (emitter.stats.consumedLineCount - before),
+                lastEventId: emitter.stats.lastTimestamp)
+        }
+
         if emitter.hasPendingCalls {
             // A tool call is still awaiting its output (long-running tool caught by the
             // quiescence window). Don't fabricate a result — skip this round entirely;
@@ -884,12 +1061,9 @@ extension CodexEngine {
             return
         }
 
-        let newCodex = SideCursor(byteOffset: consumed,
-                                  lineCount: rec.codex.lineCount + emitter.stats.consumedLineCount,
-                                  lastEventId: emitter.stats.lastTimestamp)
-
         guard !lines.isEmpty else {
             rec.codex = newCodex
+            rec.codexSegments = segments.isEmpty ? rec.codexSegments : newSegments
             rec.state = PairState.synced.rawValue
             rec.lastSyncAt = isoNow()
             store.pairs[idx] = rec
@@ -897,7 +1071,7 @@ extension CodexEngine {
         }
 
         let data = serializeJSONL(lines)
-        let base = (try? FileManager.default.attributesOfItem(atPath: rec.claudeTranscriptPath))?[.size] as? Int64 ?? 0
+        let base = (try? fm.attributesOfItem(atPath: rec.claudeTranscriptPath))?[.size] as? Int64 ?? 0
         rec.inFlight = WriteIntent(
             targetSide: "claude", targetPath: rec.claudeTranscriptPath,
             baseOffset: base, length: Int64(data.count),
@@ -908,7 +1082,8 @@ extension CodexEngine {
             postCodex: newCodex,
             postChainTail: emitter.chainTail,
             postTurnIndex: rec.codexTurnIndex,
-            postEmitIndex: emitter.nextLineIndex)
+            postEmitIndex: emitter.nextLineIndex,
+            postSegments: segments.isEmpty ? nil : newSegments)
         store.pairs[idx] = rec
         try LinkStoreIO.save(store)
 
@@ -920,6 +1095,7 @@ extension CodexEngine {
         rec.codex = rec.inFlight!.postCodex
         rec.claudeChainTail = rec.inFlight!.postChainTail
         rec.claudeEmitIndex = rec.inFlight!.postEmitIndex
+        if let segs = rec.inFlight!.postSegments { rec.codexSegments = segs }
         rec.inFlight = nil
         rec.state = PairState.synced.rawValue
         rec.lastSyncAt = isoNow()

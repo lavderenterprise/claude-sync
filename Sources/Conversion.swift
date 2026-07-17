@@ -307,6 +307,27 @@ final class CodexToClaudeEmitter {
     private var pendingCalls: [(id: String, name: String, input: Any)] = []
     private(set) var stats = Stats()
 
+    // Replay dedup for fork chains: a continuation segment may replay the parent's
+    // history before the new turns. While `dedupActive`, user turns whose text was
+    // already emitted in this chain are skipped (with everything up to the next user
+    // turn); the first genuinely new user turn switches emission back on for good.
+    private var emittedUserHashes: Set<Int> = []
+    private var dedupActive = false
+    private var skippingReplayedTurn = false
+
+    /// Call at the start of each chain segment. `dedupReplay` is true for fork
+    /// children being consumed from the beginning.
+    func beginSegment(dedupReplay: Bool) {
+        dedupActive = dedupReplay
+        skippingReplayedTurn = false
+    }
+
+    /// Seeds the replay dedup with user turns already present on the Claude side
+    /// (needed when an incremental sync starts consuming a fresh fork child).
+    func seedEmittedUserHashes(_ hashes: Set<Int>) {
+        emittedUserHashes.formUnion(hashes)
+    }
+
     /// Codex-injected control payloads that must not bounce between the apps.
     private static let controlPrefixes = ["<environment_context>", "<user_instructions>",
                                           "<permissions", "<recommended_plugins",
@@ -341,12 +362,21 @@ final class CodexToClaudeEmitter {
             guard line.payloadType == "user_message",
                   let text = line.payload["message"] as? String, !text.isEmpty,
                   !isControl(text) else { return [] }
+            let h = text.hashValue
+            if dedupActive, emittedUserHashes.contains(h) {
+                skippingReplayedTurn = true         // replayed prefix: swallow the turn
+                return []
+            }
+            dedupActive = false                     // first new turn ends the replay prefix
+            skippingReplayedTurn = false
+            emittedUserHashes.insert(h)
             // A user turn interrupts any in-flight tool call: settle pairs first.
             var out = flushPendingCalls(ts: ts)
             out.append(emit("user", ["role": "user", "content": text], ts: ts))
             return out
 
         case "response_item":
+            guard !skippingReplayedTurn else { return [] }
             switch line.payloadType {
             case "message":
                 guard (line.payload["role"] as? String) == "assistant",

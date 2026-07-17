@@ -4,7 +4,14 @@ import AppKit
 // MARK: - Codex side: paths, thread enumeration, rollout streaming
 
 enum CodexPaths {
-    static let home = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".codex")
+    /// Honors CODEX_HOME like the codex CLI itself — also what makes the engine
+    /// testable against a synthetic Codex installation.
+    static let home: URL = {
+        if let env = ProcessInfo.processInfo.environment["CODEX_HOME"], !env.isEmpty {
+            return URL(filePath: env)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appending(path: ".codex")
+    }()
     static let sessionsDir = home.appending(path: "sessions")
     static let stateDB = home.appending(path: "state_5.sqlite")
     static let sessionIndex = home.appending(path: "session_index.jsonl")
@@ -28,6 +35,9 @@ struct CodexThreadInfo {
     let updatedAtMs: Int
     let archived: Bool
     let rolloutSize: Int64
+    /// Fork/continuation link (newer Codex schemas): the thread this one continues.
+    /// The ChatGPT UI stitches such chains into ONE visible chat — so must we.
+    let parentId: String?
 }
 
 /// One rollout line: {timestamp, type, payload}.
@@ -63,10 +73,15 @@ enum CodexIO {
     }
 
     private static func threadsFromDB() -> [CodexThreadInfo] {
-        guard let db = try? SQLiteDB(path: CodexPaths.stateDB.path, readOnly: true),
-              let rows = try? db.query("""
+        guard let db = try? SQLiteDB(path: CodexPaths.stateDB.path, readOnly: true) else { return [] }
+        // Fork-link columns exist only in newer schemas — probe and select accordingly.
+        let cols = (try? db.query("PRAGMA table_info(threads)"))?
+            .compactMap { $0["name"]?.asString } ?? []
+        let linkCols = ["forked_from_id", "parent_thread_id"].filter(cols.contains)
+        let linkSelect = linkCols.isEmpty ? "" : ", " + linkCols.joined(separator: ", ")
+        guard let rows = try? db.query("""
                   SELECT id, rollout_path, title, cwd, model, created_at_ms, updated_at_ms,
-                         archived, first_user_message
+                         archived, first_user_message\(linkSelect)
                   FROM threads
                   """) else { return [] }
         let fm = FileManager.default
@@ -77,6 +92,8 @@ enum CodexIO {
             let title = row["title"]?.asString
                 ?? row["first_user_message"]?.asString.map { String($0.prefix(60)) }
                 ?? "(untitled)"
+            let parent = linkCols.lazy.compactMap { row[$0]?.asString }
+                .first { !$0.isEmpty && $0 != id }
             return CodexThreadInfo(
                 id: id,
                 rolloutPath: rollout,
@@ -86,7 +103,8 @@ enum CodexIO {
                 createdAtMs: Int(row["created_at_ms"]?.asInt ?? 0),
                 updatedAtMs: Int(row["updated_at_ms"]?.asInt ?? 0),
                 archived: (row["archived"]?.asInt ?? 0) != 0,
-                rolloutSize: size)
+                rolloutSize: size,
+                parentId: parent)
         }
     }
 
@@ -116,7 +134,8 @@ enum CodexIO {
                 createdAtMs: mtime,
                 updatedAtMs: mtime,
                 archived: false,
-                rolloutSize: (attrs?[.size] as? Int64) ?? 0))
+                rolloutSize: (attrs?[.size] as? Int64) ?? 0,
+                parentId: nil))
         }
         return out
     }
