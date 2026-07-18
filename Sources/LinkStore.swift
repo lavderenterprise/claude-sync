@@ -62,6 +62,12 @@ struct PairRecord: Codable {
     /// Ordered by creation; each keeps its own consumption cursor. Optional so v1
     /// ledgers keep decoding untouched.
     var codexSegments: [ChainSegment]?
+    /// Claude prompt-edit forks: editing a past prompt makes the desktop write a NEW
+    /// session file (ancestor lines copied verbatim, same uuids) and abandon the old
+    /// one. The pair follows the active file; retired ancestor ids live here so their
+    /// events route to this pair and they never import as twin threads. Optional for
+    /// pre-fork ledgers.
+    var claudeForkedFrom: [String]?
 }
 
 struct ChainSegment: Codable {
@@ -74,6 +80,10 @@ struct LinkStoreFile: Codable {
     var schemaVersion: Int
     var updatedAt: String
     var pairs: [PairRecord]
+    /// Codex threads archived by a consolidation (twin duplicates). If the user ever
+    /// unarchives one, it must NOT silently re-import as a fresh duplicate chat.
+    /// Optional for pre-consolidation ledgers.
+    var retiredCodexThreadIds: [String]?
 }
 
 enum LinkStoreError: Error { case unreadable(String), futureSchema(Int) }
@@ -97,7 +107,8 @@ enum LinkStoreIO {
         if FileManager.default.fileExists(atPath: url.path) {
             throw LinkStoreError.unreadable("both codex-links.json and .bak failed to parse")
         }
-        return LinkStoreFile(schemaVersion: currentSchema, updatedAt: isoNow(), pairs: [])
+        return LinkStoreFile(schemaVersion: currentSchema, updatedAt: isoNow(), pairs: [],
+                             retiredCodexThreadIds: nil)
     }
 
     static func save(_ file: LinkStoreFile) throws {

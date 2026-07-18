@@ -109,6 +109,15 @@ func flattenContent(_ content: Any?) -> String {
     return ""
 }
 
+/// Claude writes a synthetic user line ("[Request interrupted by user]", possibly with
+/// a "for tool use" suffix) when a turn is aborted. It is UI bookkeeping, not
+/// conversation: never export it, and never seed replay-dedup with it — both sides
+/// must apply the SAME predicate or the dedup sequences drift apart.
+func isInterruptionArtifact(_ text: String) -> Bool {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.hasPrefix("[Request interrupted by user") && t.hasSuffix("]") && t.count <= 64
+}
+
 // MARK: - Claude → Codex (incremental emitter; scales to arbitrarily large regions)
 
 /// Feed Claude lines one at a time; rollout lines come out. The structure replicates
@@ -175,6 +184,8 @@ final class ClaudeToCodexEmitter {
         // A user line that is only tool results is the tail of the agent's work,
         // not a user turn — the native importer demotes it to an assistant message.
         let role = (line.type == "assistant" || extracted.onlyToolResult) ? "assistant" : "user"
+
+        if role == "user", isInterruptionArtifact(extracted.text) { return [] }
 
         if role == "user" {
             var out = closeTurn(completedAt: nil)
@@ -359,9 +370,12 @@ final class CodexToClaudeEmitter {
     }
 
     /// Codex-injected control payloads that must not bounce between the apps.
+    /// The interruption artifact rides along: pre-filter rollouts still contain it as a
+    /// user_message and it must neither re-enter Claude nor enter the dedup sequences.
     private static let controlPrefixes = ["<environment_context>", "<user_instructions>",
                                           "<permissions", "<recommended_plugins",
-                                          "<model_switch", "<EXTERNAL SESSION IMPORTED>"]
+                                          "<model_switch", "<EXTERNAL SESSION IMPORTED>",
+                                          "[Request interrupted by user"]
 
     init(claudeSessionId: String, codexId: String, cwd: String, model: String,
          chainTail: String?, startLineIndex: Int) {

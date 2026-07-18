@@ -72,6 +72,23 @@ enum CodexIO {
         }.isEmpty
     }
 
+    /// originator recorded in the rollout's session_meta (first line). Our exports say
+    /// "claude_session_sync"; anything else means Codex itself minted the thread —
+    /// the discriminator consolidation uses to pick the canonical twin.
+    static func rolloutOriginator(path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        // session_meta lines carry user_instructions inline and run ~40 KB on real
+        // installs — read wide enough to always cover the first newline.
+        guard let data = try? fh.read(upToCount: 1 << 20),
+              let nl = data.firstIndex(of: UInt8(ascii: "\n")),
+              let d = try? JSONSerialization.jsonObject(with: Data(data[data.startIndex..<nl]))
+                as? [String: Any],
+              (d["type"] as? String) == "session_meta",
+              let p = d["payload"] as? [String: Any] else { return nil }
+        return p["originator"] as? String
+    }
+
     private static func threadsFromDB() -> [CodexThreadInfo] {
         guard let db = try? SQLiteDB(path: CodexPaths.stateDB.path, readOnly: true) else { return [] }
         // Fork-link columns exist only in newer schemas — probe and select accordingly.

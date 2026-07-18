@@ -53,6 +53,9 @@ final class CodexEngine {
         // Every thread that is a chain CHILD of some root: never shown as its own row.
         let childIds: Set<String> = Set(chains.values.flatMap { $0.children.map(\.id) })
         if attachNewSegments(&store, codexById: codexById) { try? LinkStoreIO.save(store) }
+        // Claude prompt-edit forks: the new file continues an existing pair — adopt it
+        // BEFORE the unlinked classification below can offer it as a fresh import.
+        if adoptClaudeForks(&store, claudeById: claudeById) { try? LinkStoreIO.save(store) }
 
         let fm = FileManager.default
         var rows: [PairRow] = []
@@ -115,12 +118,17 @@ final class CodexEngine {
 
         let pairedClaude = Set(store.pairs.map(\.claudeSessionId))
         let pairedCodex = Set(store.pairs.map(\.codexThreadId))
+        // Retired = fork ancestors and consolidated duplicates: represented by their
+        // pair already, never offered as fresh imports again.
+        let retiredClaude = Set(store.pairs.flatMap { $0.claudeForkedFrom ?? [] })
+        let retiredCodex = Set(store.retiredCodexThreadIds ?? [])
 
-        for (id, s) in claudeById where !pairedClaude.contains(id) {
+        for (id, s) in claudeById where !pairedClaude.contains(id)
+                                         && !retiredClaude.contains(id) {
             rows.append(unlinkedClaudeRow(s))
         }
         for (id, t) in codexById where !pairedCodex.contains(id) && !childIds.contains(id)
-                                        && !t.archived {
+                                        && !t.archived && !retiredCodex.contains(id) {
             // Chain roots represent the whole chat; children never get their own row.
             let leafActivity = chains[id]?.leaf.updatedAtMs ?? t.updatedAtMs
             rows.append(PairRow(
@@ -337,6 +345,368 @@ extension CodexEngine {
         }
         guard !targets.isEmpty else { return 0 }
         return AppServerRPC.archiveThreads(targets)
+    }
+}
+
+// MARK: - Claude prompt-edit forks (the desktop forks the session into a NEW file)
+
+extension CodexEngine {
+    /// Editing a past prompt makes the Claude desktop write a NEW session file that
+    /// copies the ancestor lines VERBATIM (same uuids) and diverges at the edit point,
+    /// abandoning the old file. Treating that file as a fresh session exported a twin
+    /// Codex thread ending in "[Request interrupted by user]". Instead: re-link the
+    /// existing pair to the fork file so only the divergent turns flow — into the SAME
+    /// thread. Runs in scan AND at syncRow entry (watcher events race scans).
+    func adoptClaudeForks(_ store: inout LinkStoreFile,
+                          claudeById: [String: ClaudeSessionInfo]) -> Bool {
+        var paired = Set(store.pairs.map(\.claudeSessionId))
+        var retired = Set(store.pairs.flatMap { $0.claudeForkedFrom ?? [] })
+        var rootCache: [String: String] = [:]
+        func root(_ path: String) -> String? {
+            if let c = rootCache[path] { return c.isEmpty ? nil : c }
+            let r = ClaudeIO.rootUuid(path: path)
+            rootCache[path] = r ?? ""
+            return r
+        }
+
+        var dirty = false
+        // Oldest-first so that with several forks of one chat the NEWEST ends up as
+        // the pair's active file and the earlier ones retire.
+        let unlinked = claudeById.values
+            .filter { !paired.contains($0.cliSessionId) && !retired.contains($0.cliSessionId) }
+            .sorted { $0.lastActivityAt < $1.lastActivityAt }
+
+        for s in unlinked {
+            guard let sRoot = root(s.transcriptPath) else { continue }
+            let dir = (s.transcriptPath as NSString).deletingLastPathComponent
+            let candidates = store.pairs.indices.filter { i in
+                let p = store.pairs[i].claudeTranscriptPath
+                return (p as NSString).deletingLastPathComponent == dir && root(p) == sRoot
+            }
+            guard !candidates.isEmpty else { continue }
+
+            // Deepest ancestor wins: the pair whose SYNCED region shares the longest
+            // prefix. Only the synced region counts — matching against unsynced tail
+            // lines would mark never-exported turns as already mirrored (data loss).
+            var bestIdx = -1
+            var best: (Int64, Int, String?) = (0, 0, nil)
+            for i in candidates {
+                let anc = ClaudeIO.uuidsInRegion(path: store.pairs[i].claudeTranscriptPath,
+                                                 upTo: store.pairs[i].claude.byteOffset)
+                guard !anc.isEmpty else { continue }
+                let div = ClaudeIO.forkDivergence(forkPath: s.transcriptPath, ancestorUuids: anc)
+                if bestIdx < 0 || div.byteOffset > best.0 { best = div; bestIdx = i }
+            }
+            guard bestIdx >= 0, best.0 > 0 else { continue }
+
+            var rec = store.pairs[bestIdx]
+            let currentActivity = claudeById[rec.claudeSessionId]?.lastActivityAt ?? 0
+            var forkedFrom = rec.claudeForkedFrom ?? []
+            if s.lastActivityAt >= currentActivity {
+                // The fork is the live continuation: the pair follows it.
+                forkedFrom.append(rec.claudeSessionId)
+                retired.insert(rec.claudeSessionId)
+                paired.remove(rec.claudeSessionId)
+                rec.claudeSessionId = s.cliSessionId
+                rec.claudeTranscriptPath = s.transcriptPath
+                rec.claude = SideCursor(byteOffset: best.0, lineCount: best.1,
+                                        lastEventId: best.2 ?? rec.claude.lastEventId)
+                if let u = best.2 { rec.claudeChainTail = u }
+                paired.insert(s.cliSessionId)
+            } else {
+                // Stale sibling fork: claim it so it can never import as a twin, but
+                // keep the pair on its current (newer) file.
+                forkedFrom.append(s.cliSessionId)
+                retired.insert(s.cliSessionId)
+            }
+            rec.claudeForkedFrom = forkedFrom
+            store.pairs[bestIdx] = rec
+            dirty = true
+        }
+        return dirty
+    }
+
+    /// Retired fork ancestors keep their transcript on disk but must leave the desktop
+    /// sidebar — one logical chat, one visible session. Runs after the backup in every
+    /// write path; idempotent single pass over the index files.
+    func hideRetiredClaudeSessions(_ store: LinkStoreFile) {
+        let keep = Set(store.pairs.map(\.claudeSessionId))
+        let retired = Set(store.pairs.flatMap { $0.claudeForkedFrom ?? [] }).subtracting(keep)
+        guard !retired.isEmpty else { return }
+        for (_, dir) in discoverAccounts() {
+            for file in sessionFiles(in: dir) {
+                guard let d = readJSON(file), let cli = d["cliSessionId"] as? String,
+                      retired.contains(cli) else { continue }
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+    }
+}
+
+// MARK: - Twin consolidation (two mirrored copies of one logical chat → one)
+
+/// What consolidation would do for one duplicated chat — shown to the user before
+/// anything runs, and the exact instructions the apply step follows.
+struct TwinPlan: Identifiable {
+    let title: String
+    let cwd: String
+    let keepClaudeId: String
+    let keepCodexId: String
+    let relinkClaude: Bool            // canonical pair must adopt the active fork file
+    let dropClaudeIds: [String]       // sidebar entries hidden; transcripts stay on disk
+    let archiveCodexIds: [String]     // archived via the official RPC (reversible)
+    let dropPairIds: [String]         // ledger records folded into the canonical pair
+    var id: String { keepCodexId }
+}
+
+extension CodexEngine {
+    /// Conversational user turns as normalized hashes — the same extraction the
+    /// replay-dedup seed uses. Cached by (path, size, mtime): the planner runs on
+    /// every reload and the transcripts can be tens of MB.
+    private static var seqCache: [String: (key: String, seq: [Int])] = [:]
+    private static let seqCacheLock = NSLock()
+
+    func userTurnSequence(_ path: String) -> [Int] {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let key = "\(attrs?[.size] as? Int64 ?? -1)|\((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        Self.seqCacheLock.lock()
+        if let hit = Self.seqCache[path], hit.key == key {
+            Self.seqCacheLock.unlock()
+            return hit.seq
+        }
+        Self.seqCacheLock.unlock()
+        var out: [Int] = []
+        _ = try? ClaudeIO.streamLines(path: path) { line in
+            guard line.type == "user", !line.isMeta, !line.isSidechain,
+                  let c = line.message?["content"] else { return }
+            if let s = c as? String {
+                if !isInterruptionArtifact(s) {
+                    out.append(CodexToClaudeEmitter.normalizedHash(s))
+                }
+            } else if let items = c as? [[String: Any]] {
+                let text = items.filter { ($0["type"] as? String) == "text" }
+                    .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                if !text.isEmpty, !isInterruptionArtifact(text) {
+                    out.append(CodexToClaudeEmitter.normalizedHash(text))
+                }
+            }
+        }
+        Self.seqCacheLock.lock()
+        Self.seqCache[path] = (key, out)
+        Self.seqCacheLock.unlock()
+        return out
+    }
+
+    /// Read-only twin detection over the current ledger.
+    func planConsolidation() -> [TwinPlan] {
+        guard let store = try? LinkStoreIO.load() else { return [] }
+        let claudeById = Dictionary(uniqueKeysWithValues:
+            ClaudeIO.enumerateSessions().map { ($0.cliSessionId, $0) })
+        return planConsolidation(store, claudeById: claudeById)
+    }
+
+    func planConsolidation(_ store: LinkStoreFile,
+                           claudeById: [String: ClaudeSessionInfo]) -> [TwinPlan] {
+        var rootCache: [String: String] = [:]
+        func root(_ path: String) -> String? {
+            if let c = rootCache[path] { return c.isEmpty ? nil : c }
+            let r = ClaudeIO.rootUuid(path: path)
+            rootCache[path] = r ?? ""
+            return r
+        }
+        func stamp(_ rolloutPath: String) -> String? {
+            // "rollout-2026-07-18T11-12-16-" — the second the thread was minted.
+            let n = (rolloutPath as NSString).lastPathComponent
+            guard n.hasPrefix("rollout-"), n.count > 28 else { return nil }
+            return String(n.prefix(28))
+        }
+        func originator(_ rec: PairRecord) -> String? {
+            CodexIO.rolloutOriginator(path: rec.codexRolloutPath)
+        }
+        /// Twin signature: same claude root uuid (prompt-edit fork twins), OR rollouts
+        /// minted the same second with near-identical uuidv7 timestamps where at least
+        /// one side is our own export (import-fork twins à la ChatGPT continue-fork).
+        func isTwin(_ a: PairRecord, _ b: PairRecord) -> Bool {
+            if let ra = root(a.claudeTranscriptPath), let rb = root(b.claudeTranscriptPath),
+               ra == rb { return true }
+            guard let sa = stamp(a.codexRolloutPath), let sb = stamp(b.codexRolloutPath),
+                  sa == sb else { return false }
+            let ha = a.codexThreadId.replacingOccurrences(of: "-", with: "").prefix(9)
+            let hb = b.codexThreadId.replacingOccurrences(of: "-", with: "").prefix(9)
+            guard ha == hb else { return false }
+            return originator(a) == "claude_session_sync"
+                || originator(b) == "claude_session_sync"
+        }
+
+        var plans: [TwinPlan] = []
+        let byCwd = Dictionary(grouping: store.pairs.indices, by: { store.pairs[$0].cwd })
+        for (_, idxs) in byCwd where idxs.count > 1 {
+            // Connected components over the twin relation (groups are tiny).
+            var groups: [[Int]] = []
+            for i in idxs {
+                if let g = groups.indices.first(where: { gi in
+                    groups[gi].contains { isTwin(store.pairs[i], store.pairs[$0]) } }) {
+                    groups[g].append(i)
+                } else {
+                    groups.append([i])
+                }
+            }
+            for group in groups where group.count > 1 {
+                let members = group.map { store.pairs[$0] }
+                // Canonical codex thread: natively minted if any (earliest wins);
+                // otherwise the one still being written to (latest rollout mtime).
+                let native = members.filter {
+                    let o = originator($0)
+                    return o != nil && o != "claude_session_sync"
+                }
+                let canonical: PairRecord
+                if !native.isEmpty {
+                    canonical = native.min { $0.codexThreadId < $1.codexThreadId }!
+                } else {
+                    func mtime(_ p: String) -> Date {
+                        (try? FileManager.default.attributesOfItem(atPath: p))?[.modificationDate]
+                            as? Date ?? .distantPast
+                    }
+                    canonical = members.max {
+                        mtime($0.codexRolloutPath) < mtime($1.codexRolloutPath) }!
+                }
+                // Active claude session: the most recently touched among the members.
+                let active = members.max {
+                    (claudeById[$0.claudeSessionId]?.lastActivityAt ?? 0) <
+                    (claudeById[$1.claudeSessionId]?.lastActivityAt ?? 0) }!
+                var keepClaude = canonical.claudeSessionId
+                var relink = false
+                if active.claudeSessionId != canonical.claudeSessionId,
+                   let ra = root(active.claudeTranscriptPath),
+                   root(canonical.claudeTranscriptPath) == ra {
+                    // The user's live file is a fork of the canonical transcript:
+                    // the canonical pair adopts it and its divergent turns flow in.
+                    keepClaude = active.claudeSessionId
+                    relink = true
+                }
+                // Consolidation must be provably lossless in what it hides: every
+                // dropped session is either a uuid-verified member of the kept file's
+                // fork family (its extra tail is the branch the user abandoned, already
+                // mirrored), or its user-turn sequence is a strict prefix of the kept
+                // one (pure duplicate). Account-switch relics hold COMPLEMENTARY
+                // halves with unrelated roots — those never qualify and stay visible.
+                let keepPath = members.first { $0.claudeSessionId == keepClaude }
+                    .map(\.claudeTranscriptPath)
+                    ?? (claudeById[keepClaude]?.transcriptPath ?? "")
+                let keepRoot = root(keepPath)
+                let drops = members.map(\.claudeSessionId).filter { $0 != keepClaude }
+                let provable = drops.allSatisfy { d in
+                    guard let path = members.first(where: { $0.claudeSessionId == d })?
+                        .claudeTranscriptPath else { return false }
+                    if let r = root(path), let kr = keepRoot, r == kr { return true }
+                    let dropSeq = userTurnSequence(path)
+                    let keepSeq = userTurnSequence(keepPath)
+                    return !keepSeq.isEmpty && dropSeq.count <= keepSeq.count
+                        && Array(keepSeq.prefix(dropSeq.count)) == dropSeq
+                }
+                guard provable else { continue }
+
+                let archiveIds = members.filter { $0.codexThreadId != canonical.codexThreadId }
+                    .flatMap { [$0.codexThreadId] + ($0.codexSegments ?? []).map(\.threadId) }
+                plans.append(TwinPlan(
+                    title: canonical.title,
+                    cwd: canonical.cwd,
+                    keepClaudeId: keepClaude,
+                    keepCodexId: canonical.codexThreadId,
+                    relinkClaude: relink,
+                    dropClaudeIds: drops,
+                    archiveCodexIds: archiveIds,
+                    dropPairIds: members.map(\.claudeSessionId)
+                        .filter { $0 != canonical.claudeSessionId }))
+            }
+        }
+        return plans
+    }
+
+    /// Applies every plan: archive the duplicate Codex threads (official RPC), fold the
+    /// spurious ledger records into the canonical pair, hide the dead sidebar entries,
+    /// then flow any divergent turns into the kept thread. Everything it removes from
+    /// view stays on disk; the run backup covers the rest.
+    func consolidateTwins() -> CodexSyncReport {
+        withLedgerLock { consolidateInner() }
+    }
+
+    private func consolidateInner() -> CodexSyncReport {
+        var report = CodexSyncReport()
+        do {
+            var store = try LinkStoreIO.load()
+            if recover(&store) { try LinkStoreIO.save(store) }
+            let claudeById = Dictionary(uniqueKeysWithValues:
+                ClaudeIO.enumerateSessions().map { ($0.cliSessionId, $0) })
+            let plans = planConsolidation(store, claudeById: claudeById)
+            guard !plans.isEmpty else { return report }
+
+            report.backupDir = try BackupManager.runBackup()
+
+            let alreadyArchived = Set(CodexIO.enumerateThreads().filter(\.archived).map(\.id))
+            for plan in plans {
+                // Archive FIRST. If the RPC fails, leave this group fully untouched:
+                // the still-present pair records keep the duplicates from re-importing.
+                // Threads a previous run (or the user) already archived count as done.
+                let toArchive = plan.archiveCodexIds.filter { !alreadyArchived.contains($0) }
+                let archived = AppServerRPC.archiveThreads(toArchive)
+                guard archived == toArchive.count else {
+                    report.failed.append(CodexFailure(
+                        title: plan.title, side: "codex",
+                        reason: "archive RPC failed (\(archived)/\(toArchive.count) archived) — group left untouched, retry later"))
+                    continue
+                }
+                var retiredCodex = store.retiredCodexThreadIds ?? []
+                retiredCodex.append(contentsOf: plan.archiveCodexIds)
+                store.retiredCodexThreadIds = retiredCodex
+
+                store.pairs.removeAll { plan.dropPairIds.contains($0.claudeSessionId) }
+                guard let ci = store.pairs.firstIndex(where: {
+                    $0.codexThreadId == plan.keepCodexId }) else { continue }
+                var rec = store.pairs[ci]
+                var forkedFrom = rec.claudeForkedFrom ?? []
+                if plan.relinkClaude, let info = claudeById[plan.keepClaudeId] {
+                    let anc = ClaudeIO.uuidsInRegion(path: rec.claudeTranscriptPath,
+                                                     upTo: rec.claude.byteOffset)
+                    let div = ClaudeIO.forkDivergence(forkPath: info.transcriptPath,
+                                                      ancestorUuids: anc)
+                    forkedFrom.append(rec.claudeSessionId)
+                    rec.claudeSessionId = info.cliSessionId
+                    rec.claudeTranscriptPath = info.transcriptPath
+                    rec.claude = SideCursor(byteOffset: div.byteOffset,
+                                            lineCount: div.lineCount,
+                                            lastEventId: div.lastSharedUuid ?? rec.claude.lastEventId)
+                    if let u = div.lastSharedUuid { rec.claudeChainTail = u }
+                }
+                for d in plan.dropClaudeIds
+                    where d != rec.claudeSessionId && !forkedFrom.contains(d) {
+                    forkedFrom.append(d)
+                }
+                rec.claudeForkedFrom = forkedFrom.isEmpty ? nil : forkedFrom
+                store.pairs[ci] = rec
+                try LinkStoreIO.save(store)
+
+                hideRetiredClaudeSessions(store)
+                report.consolidatedGroups += 1
+                report.wroteCodexSide = true
+                report.wroteClaudeSide = true
+
+                // Flow the divergent turns into the kept thread right away.
+                if let idx = store.pairs.firstIndex(where: {
+                    $0.codexThreadId == plan.keepCodexId }) {
+                    do { try syncPair(at: idx, store: &store, report: &report) }
+                    catch {
+                        report.failed.append(CodexFailure(title: plan.title, side: "-",
+                                                          reason: plainReason(error)))
+                    }
+                }
+                try LinkStoreIO.save(store)
+            }
+        } catch {
+            report.failed.append(CodexFailure(title: "consolidate", side: "-",
+                                              reason: plainReason(error)))
+        }
+        return report
     }
 }
 
@@ -623,14 +993,23 @@ extension CodexEngine {
                 CodexIO.enumerateThreads().map { ($0.id, $0) })
             if healRolloutPaths(&store, codexById: codexById) { try LinkStoreIO.save(store) }
             if attachNewSegments(&store, codexById: codexById) { try LinkStoreIO.save(store) }
+            // A watcher event can arrive before any scan saw the fork file: adopt here
+            // too, or the fallback below would import it as a twin thread.
+            let claudeById = Dictionary(uniqueKeysWithValues:
+                ClaudeIO.enumerateSessions().map { ($0.cliSessionId, $0) })
+            if adoptClaudeForks(&store, claudeById: claudeById) { try LinkStoreIO.save(store) }
+            // Consolidated duplicates: if the user unarchives one, never re-import it.
+            if (store.retiredCodexThreadIds ?? []).contains(id) { return report }
 
             report.backupDir = try BackupManager.runBackup()
+            hideRetiredClaudeSessions(store)
 
             if let idx = store.pairs.firstIndex(where: {
                 $0.claudeSessionId == id || $0.codexThreadId == id
-                    || ($0.codexSegments ?? []).contains(where: { $0.threadId == id }) }) {
+                    || ($0.codexSegments ?? []).contains(where: { $0.threadId == id })
+                    || ($0.claudeForkedFrom ?? []).contains(id) }) {
                 try syncPair(at: idx, store: &store, report: &report)
-            } else if let claude = ClaudeIO.enumerateSessions().first(where: { $0.cliSessionId == id }) {
+            } else if let claude = claudeById[id] {
                 try importClaude(claude, store: &store, report: &report)
             } else if let codex = CodexIO.enumerateThreads().first(where: { $0.id == id }) {
                 // Never import a chain CHILD as a standalone chat: resolve to its root.
@@ -695,6 +1074,7 @@ extension CodexEngine {
             guard !actionable.isEmpty else { return report }
 
             report.backupDir = try BackupManager.runBackup()
+            hideRetiredClaudeSessions(store)
 
             // Oldest-first: date-partitioned rollout dirs fill chronologically and an
             // interruption leaves the older history complete.
@@ -712,7 +1092,8 @@ extension CodexEngine {
                 progress(BulkProgress(done: i, total: ordered.count, current: row.title))
                 do {
                     if let idx = store.pairs.firstIndex(where: {
-                        $0.claudeSessionId == row.id || $0.codexThreadId == row.id }) {
+                        $0.claudeSessionId == row.id || $0.codexThreadId == row.id
+                            || ($0.claudeForkedFrom ?? []).contains(row.id) }) {
                         try syncPair(at: idx, store: &store, report: &report)
                     } else if row.state == .unlinkedClaude, let s = claudeById[row.id] {
                         try importClaude(s, store: &store, report: &report)
@@ -764,7 +1145,8 @@ extension CodexEngine {
             if healRolloutPaths(&store, codexById: codexById) { try LinkStoreIO.save(store) }
             if attachNewSegments(&store, codexById: codexById) { try LinkStoreIO.save(store) }
             guard let idx = store.pairs.firstIndex(where: {
-                $0.claudeSessionId == id || $0.codexThreadId == id }) else {
+                $0.claudeSessionId == id || $0.codexThreadId == id
+                    || ($0.claudeForkedFrom ?? []).contains(id) }) else {
                 throw EngineError.rowNotFound
             }
             if store.pairs[idx].inFlight != nil { throw EngineError.interruptedWrite }
@@ -1151,12 +1533,18 @@ extension CodexEngine {
             _ = try? ClaudeIO.streamLines(path: rec.claudeTranscriptPath) { line in
                 guard line.type == "user", !line.isMeta, !line.isSidechain,
                       let c = line.message?["content"] else { return }
+                // Interruption artifacts are excluded from BOTH emission paths, so the
+                // seed must exclude them too or the replay sequences drift apart.
                 if let s = c as? String {
-                    ordered.append(CodexToClaudeEmitter.normalizedHash(s))
+                    if !isInterruptionArtifact(s) {
+                        ordered.append(CodexToClaudeEmitter.normalizedHash(s))
+                    }
                 } else if let items = c as? [[String: Any]] {
                     let text = items.filter { ($0["type"] as? String) == "text" }
                         .compactMap { $0["text"] as? String }.joined(separator: "\n")
-                    if !text.isEmpty { ordered.append(CodexToClaudeEmitter.normalizedHash(text)) }
+                    if !text.isEmpty, !isInterruptionArtifact(text) {
+                        ordered.append(CodexToClaudeEmitter.normalizedHash(text))
+                    }
                 }
             }
             emitter.seedEmittedUserSequence(ordered)

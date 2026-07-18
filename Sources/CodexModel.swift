@@ -36,6 +36,7 @@ struct CodexFailure: Identifiable {
 struct CodexSyncReport: Identifiable {
     var created = 0                   // new counterpart sessions created
     var updated = 0                   // existing counterparts appended to
+    var consolidatedGroups = 0        // duplicated chats folded into one
     var skippedConflicts = 0
     var failed: [CodexFailure] = []
     var fatal: CodexFatal?

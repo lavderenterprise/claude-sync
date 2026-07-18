@@ -85,6 +85,79 @@ enum ClaudeIO {
     }
 }
 
+// MARK: - Fork-file forensics (prompt-edit forks copy ancestor lines verbatim)
+
+extension ClaudeIO {
+    /// First uuid in the transcript. A fork file copies the ancestor chain with the
+    /// SAME uuids, so a shared root uuid is a definitive fork signature — independent
+    /// v4 roots cannot collide by chance.
+    static func rootUuid(path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        guard let data = try? fh.read(upToCount: 262_144) else { return nil }
+        for chunk in data.split(separator: UInt8(ascii: "\n")) {
+            if let d = try? JSONSerialization.jsonObject(with: Data(chunk)) as? [String: Any],
+               let u = d["uuid"] as? String {
+                return u
+            }
+        }
+        return nil
+    }
+
+    /// Every uuid in the first `upTo` bytes. A synced region always ends on a line
+    /// boundary, so no partial-line handling is needed.
+    static func uuidsInRegion(path: String, upTo: Int64) -> Set<String> {
+        guard upTo > 0, let fh = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? fh.close() }
+        guard let data = try? fh.read(upToCount: Int(upTo)) else { return [] }
+        var out = Set<String>()
+        for chunk in data.split(separator: UInt8(ascii: "\n")) {
+            if let d = try? JSONSerialization.jsonObject(with: Data(chunk)) as? [String: Any],
+               let u = d["uuid"] as? String {
+                out.insert(u)
+            }
+        }
+        return out
+    }
+
+    /// Extent of a fork file's shared prefix against the ancestor's synced uuids:
+    /// the byte offset past the last consecutive known line, that prefix's line count,
+    /// and the last shared uuid (the fork point — the DAG parent of whatever follows).
+    /// Lines without a uuid (titles, summaries) extend the prefix but never anchor it.
+    static func forkDivergence(forkPath: String, ancestorUuids: Set<String>)
+        -> (byteOffset: Int64, lineCount: Int, lastSharedUuid: String?) {
+        guard !ancestorUuids.isEmpty,
+              let fh = FileHandle(forReadingAtPath: forkPath) else { return (0, 0, nil) }
+        defer { try? fh.close() }
+        var offset: Int64 = 0
+        var lines = 0
+        var lastShared: String?
+        var leftover: [UInt8] = []
+        while let chunk = try? fh.read(upToCount: 4 << 20), !chunk.isEmpty {
+            let buf: [UInt8] = leftover.isEmpty ? [UInt8](chunk) : leftover + [UInt8](chunk)
+            leftover = []
+            var start = 0
+            var i = 0
+            while i < buf.count {
+                if buf[i] == UInt8(ascii: "\n") {
+                    let lineData = Data(buf[start..<i])
+                    if let d = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                       let u = d["uuid"] as? String {
+                        guard ancestorUuids.contains(u) else { return (offset, lines, lastShared) }
+                        lastShared = u
+                    }
+                    offset += Int64(i - start) + 1
+                    lines += 1
+                    start = i + 1
+                }
+                i += 1
+            }
+            leftover = Array(buf[start...])
+        }
+        return (offset, lines, lastShared)
+    }
+}
+
 // MARK: - Turn-in-flight detection (tail semantics, not just mtime quiet)
 
 /// Yields the parsed JSONL lines from the file's last `cap` bytes (first partial line

@@ -9,6 +9,7 @@ import SwiftUI
     @Published var schemaVersion: Int?
     @Published var report: CodexSyncReport?
     @Published var bulk: (done: Int, total: Int, current: String)?
+    @Published var twinPlans: [TwinPlan] = []
 
     let engine = CodexEngine()
 
@@ -40,17 +41,25 @@ import SwiftUI
         let engine = self.engine
         Task.detached(priority: .userInitiated) {
             let result = engine.scan()
+            let plans = engine.planConsolidation()
             let codexUp = CodexIO.codexIsRunning()
             let claudeUp = claudeIsRunning()
             await MainActor.run {
                 self.rows = result.rows
                 self.fatal = result.fatal
                 self.schemaVersion = result.schemaVersion
+                self.twinPlans = plans
                 self.codexRunning = codexUp
                 self.claudeRunning = claudeUp
                 self.busy = false
             }
         }
+    }
+
+    /// Fold every detected duplicated chat into a single unified one (backup runs
+    /// first inside the engine; duplicates are archived/hidden, never deleted).
+    func consolidate() {
+        run { $0.consolidateTwins() }
     }
 
     /// Sync/import a single row (writes to disk — backup runs first inside the engine).

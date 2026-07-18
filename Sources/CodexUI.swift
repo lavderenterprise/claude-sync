@@ -13,6 +13,7 @@ struct CodexView: View {
 /// One `.sheet` per view (same rationale as `Route` in UI.swift).
 enum CodexRoute: Identifiable {
     case confirmAll
+    case consolidate
     case resolve(PairRow)
     case result(CodexSyncReport)
     case verify(CodexStore.VerifyResult)
@@ -20,6 +21,7 @@ enum CodexRoute: Identifiable {
     var id: String {
         switch self {
         case .confirmAll: "confirmAll"
+        case .consolidate: "consolidate"
         case .resolve(let r): "resolve-" + r.id
         case .result(let rep): "result-" + rep.id
         case .verify(let v): "verify-" + v.id
@@ -85,6 +87,10 @@ struct CodexContent: View {
             switch r {
             case .confirmAll:
                 ConfirmAllSheet(store: store) { store.syncAll() }
+            case .consolidate:
+                ConsolidateSheet(plans: store.twinPlans, codexRunning: store.codexRunning) {
+                    store.consolidate()
+                }
             case .resolve(let row):
                 ResolveSheet(row: row) { dir in store.resolve(row, winner: dir) }
             case .result(let rep):
@@ -144,6 +150,18 @@ struct CodexContent: View {
                 Notice(icon: "exclamationmark.triangle",
                        text: "The ChatGPT app is open. It caches its thread list — restart it to see newly imported threads.",
                        tint: .orange)
+            }
+            if !store.twinPlans.isEmpty {
+                HStack(spacing: 10) {
+                    Notice(icon: "arrow.triangle.merge",
+                           text: store.twinPlans.count == 1
+                               ? "1 duplicated chat detected (a prompt edit or an import fork split it in two). Consolidate to get back a single unified chat on both sides."
+                               : "\(store.twinPlans.count) duplicated chats detected (prompt edits or import forks split them). Consolidate to get back a single unified chat per conversation.",
+                           tint: .orange)
+                    Button("Consolidate…") { route = .consolidate }
+                        .buttonStyle(.borderedProminent).tint(.orange)
+                        .disabled(store.busy)
+                }
             }
         }
         .padding(16)
@@ -365,6 +383,88 @@ struct ConfirmAllSheet: View {
     }
 }
 
+// MARK: - Consolidate sheet (duplicated chats → one unified chat per side)
+
+struct ConsolidateSheet: View {
+    let plans: [TwinPlan]
+    let codexRunning: Bool
+    let onConfirm: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Consolidate duplicated chats").font(.system(size: 15, weight: .semibold))
+                Text("Nothing has been written yet. Nothing is ever deleted: duplicates are archived (Codex) or unlisted (Claude) and every file stays on disk.")
+                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(plans) { p in
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(p.title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                            Text(p.cwd).font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary).lineLimit(1)
+                            detail("checkmark.circle", .green,
+                                   "Keeps the original Codex thread and the current Claude session"
+                                   + (p.relinkClaude ? " (re-linked to your latest edits)" : ""))
+                            detail("archivebox", .orange,
+                                   "Archives \(p.archiveCodexIds.count) duplicate Codex thread\(p.archiveCodexIds.count == 1 ? "" : "s"); any new turns they carry are merged into the kept chat first")
+                            if !p.dropClaudeIds.isEmpty {
+                                detail("eye.slash", .orange,
+                                       "Unlists \(p.dropClaudeIds.count) dead Claude session\(p.dropClaudeIds.count == 1 ? "" : "s") from the sidebar (transcripts stay on disk)")
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(.separator.opacity(0.6)))
+                    }
+                }
+                .padding(16)
+            }
+            .frame(maxHeight: 300)
+
+            Divider()
+            VStack(alignment: .leading, spacing: 7) {
+                Notice(icon: "arrow.uturn.backward",
+                       text: "A full safety backup runs before the first change. Archived threads can be unarchived from ChatGPT at any time.",
+                       tint: .blue)
+                if codexRunning {
+                    Notice(icon: "exclamationmark.triangle",
+                           text: "The ChatGPT app is open — restart it afterwards to see the unified list.",
+                           tint: .orange)
+                }
+            }
+            .padding(16)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Back up and consolidate") { dismiss(); onConfirm() }
+                    .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).tint(.orange)
+            }
+            .padding(.horizontal, 16).padding(.bottom, 16)
+        }
+        .frame(width: 560)
+    }
+
+    private func detail(_ icon: String, _ tint: Color, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: icon).font(.system(size: 10.5)).foregroundStyle(tint)
+                .frame(width: 14)
+            Text(text).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 // MARK: - Resolve sheet
 
 struct ResolveSheet: View {
@@ -521,6 +621,9 @@ struct CodexResultSheet: View {
             VStack(alignment: .leading, spacing: 9) {
                 row("Counterparts created", "\(report.created)")
                 row("Counterparts updated", "\(report.updated)")
+                if report.consolidatedGroups > 0 {
+                    row("Duplicated chats consolidated", "\(report.consolidatedGroups)")
+                }
                 if report.skippedConflicts > 0 {
                     row("Skipped (conflicts)", "\(report.skippedConflicts)")
                 }
@@ -556,7 +659,7 @@ struct CodexResultSheet: View {
             }
             .padding(16)
 
-            if report.ok && report.created + report.updated > 0
+            if report.ok && report.created + report.updated + report.consolidatedGroups > 0
                 && (report.wroteCodexSide && codexRunning || report.wroteClaudeSide) {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
@@ -594,11 +697,15 @@ struct CodexResultSheet: View {
 
     private var title: String {
         if !report.ok { return "Sync finished with errors" }
+        if report.consolidatedGroups > 0 { return "Consolidation complete" }
         if report.created + report.updated == 0 { return "Nothing to do" }
         return "Sync complete"
     }
     private var subtitle: String {
         if !report.ok { return "No data was lost — the backup is intact." }
+        if report.consolidatedGroups > 0 {
+            return "\(report.consolidatedGroups) chat\(report.consolidatedGroups == 1 ? "" : "s") unified — one conversation per side again."
+        }
         return "\(report.created) created, \(report.updated) updated."
     }
 }
