@@ -1,161 +1,233 @@
+<div align="center">
+
+<img src="docs/icon.png" alt="Claude Session Sync app icon: a circular sync glyph on a light glass tile" width="168" height="168">
+
 # Claude Session Sync
 
-A native macOS app that keeps your AI coding sessions where you expect them — across **Claude accounts** and across **assistants**:
+**Keep every Claude Code session visible across Claude accounts, and mirror your chats between Claude Code and OpenAI Codex.**
 
-- **Accounts** — shows every Claude account used on your Mac and all the Claude Code sessions inside each one, highlights what has drifted, and reconciles the account indexes with one click so no session disappears when you switch login.
-- **Codex** — bidirectional sync of chats between **Claude Code and OpenAI Codex** (the ChatGPT desktop app): full-history mirror both ways, incremental two-way updates, conflict handling, and an opt-in **auto-sync** that mirrors a chat to the other app the moment it finishes receiving a reply.
-- **Menu bar widget** — one-click sync with a live badge counting the chats waiting to sync; the app keeps working in the background with the window closed (optional launch at login).
+![macOS 14 or later](https://img.shields.io/badge/macOS-14%2B-1d1d1f)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-1d1d1f)
+![SwiftUI](https://img.shields.io/badge/SwiftUI-native-1d1d1f)
+![Zero dependencies](https://img.shields.io/badge/dependencies-none-1d1d1f)
+![License MIT](https://img.shields.io/badge/license-MIT-1d1d1f)
 
-No dependencies, no Electron, no browser. A single SwiftUI binary built against the Xcode toolchain (plus the system `libsqlite3`).
-
----
-
-## Codex sync (Claude Code ⇄ OpenAI Codex)
-
-The Codex tab pairs every Claude Code session with an OpenAI Codex thread and keeps both sides current:
-
-- **Full-history mirror**: every Claude session becomes a resumable Codex thread (rollout JSONL + `threads` row in `state_5.sqlite` + `session_index.jsonl`) and every Codex thread becomes a resumable Claude session (transcript with a valid uuid chain + desktop index entry). Verified end-to-end: `codex exec resume` and Claude both load the imported counterparts.
-- **Incremental two-way sync**: byte-offset cursors per side detect exactly what advanced; only the new region is converted and appended. Deterministic IDs make every operation idempotent — re-running never duplicates.
-- **Conversion fidelity**: Claude → Codex replicates OpenAI's own (currently server-disabled) `/import` renderer bit for bit — bounded `[external_agent_tool_call]` / `[external_agent_tool_result]` tags with key fields extracted, readable turn ids, `<EXTERNAL SESSION IMPORTED>` footer and token estimate (derived from the `codex-rs/external-agent-migration` source). Codex → Claude goes one better: `function_call`s and `custom_tool_call`s (both payload generations, string or typed-block outputs) become **native `tool_use`/`tool_result` blocks** (Claude renders arbitrary tool names natively — that's how MCP tools work), with every call guaranteed a paired result: missing outputs are synthesized on full imports, and incremental syncs wait when a call is still in flight. Claude `thinking` and Codex encrypted reasoning are skipped by design; Codex-injected control payloads are filtered so they never bounce between apps.
-- **Turn-aware, not just timer-aware**: a session whose grown side is mid-turn shows as `working…` — excluded from the badge, from Sync all and from auto-sync. "Mid-turn" is semantic, read from the file tail (an unanswered prompt, a pending tool result, an open `task_started`), because a long-running tool keeps the file silent while the turn is wide open; a 10-minute staleness cap releases abandoned turns.
-- **Conflicts**: if both sides advanced since the last sync, the pair is flagged and counted in the menu bar badge — never auto-resolved. You pick the winning side; the losing side's turns stay untouched in their own transcript (recorded as skipped in the ledger).
-- **Auto-sync (opt-in)**: one FSEvents stream watches both session trees; a per-session quiet-period timer (default 20 s) fires when a reply has finished landing, and the pair syncs by itself. Self-written events are suppressed so the engine never reacts to its own writes.
-- **Fork-aware on both sides**: Codex fork chains (`forked_from_id`/`parent_thread_id` links from git-branch merges and thread continuations) sync as ONE Claude session, exactly as the ChatGPT UI stitches them. Symmetrically, editing a past prompt in Claude — which makes the desktop fork the session into a NEW transcript file (ancestor lines copied verbatim, same uuids) — re-links the existing pair to the fork file, so only the edited branch flows into the SAME Codex thread instead of spawning a twin chat ending in `[Request interrupted by user]`. Interruption artifacts themselves are filtered from export (and from the replay-dedup seed, symmetrically).
-- **Consolidation**: if duplicated mirrors already exist (a prompt-edit fork or an import fork that split one conversation in two), the Codex tab detects them and offers one-click consolidation: divergent turns are merged into the kept thread, the duplicate Codex thread is archived via the official RPC, the dead Claude session leaves the sidebar (its transcript stays on disk), and the ledger folds to a single pair. Only provably lossless merges are offered — a hidden session must be a uuid-verified fork ancestor or an exact user-turn prefix of the kept one; complementary account-switch halves are never touched.
-- **Integrity doctor (Verify)**: read-only structural check of every pair — uuid chains of synced lines, tool_use/tool_result pairing (in-flight tails tolerated, native compaction/forks respected), rollout `session_meta` identity and turn balance, ledger-cursor coherence. Broken sessions surface before ping-pong syncing can amplify them.
-- **ChatGPT UI integration**: imports register each thread's folder in the app's Projects list and write the thread→folder hints its "organize by project" view actually reads (with no trust granted — Codex still asks per folder). Account-switch relics (the same session forked across accounts, the original stranded in an inactive account) get their mirror thread auto-archived via the official `thread/archive` RPC — writing `archived=1` to sqlite directly gets reverted by the app; the ledger follows the rollout when archiving moves it to `archived_sessions/`.
-- **Safety**: a timestamped backup (Codex DB via `VACUUM INTO` with the Online Backup API as fallback, indexes, ledger, Claude session index) precedes every writing run; transcripts are append-only with per-file `.css-bak`; every append is guarded by a fsync'd write-intent that recovers cleanly after a crash; a schema-version guard disables Codex-side writes if the (alpha) ChatGPT app changes its database format.
-
-State lives in `~/Library/Application Support/ClaudeSessionSync/` (`codex-links.json` ledger + `backups/`).
+</div>
 
 ---
 
-## The problem it solves (Accounts tab)
+Two separate annoyances turned into one app.
 
-The Claude desktop app stores its Claude Code **session index** partitioned per account:
+The first is an account problem. The Claude desktop app files its Claude Code session list per account, so the moment you switch login, every session recorded under the other account leaves the sidebar. The conversations are still on disk, but the app stops listing them.
+
+The second is a tooling problem. Work started in Claude Code and work started in OpenAI Codex live in stores that never meet, even when both assistants are pointed at the same repository, on the same Mac, on the same afternoon. Moving a task from one to the other means retyping the context and losing the trail.
+
+Claude Session Sync is a native macOS app that handles both. It reconciles the per-account session index so nothing vanishes from the sidebar, and it maintains a two way mirror between Claude Code sessions and Codex threads, with conflict handling, integrity checks, fork awareness and an opt-in auto sync that runs in the background from the menu bar.
+
+Requirements: macOS 14 or later on Apple Silicon, the Xcode command line Swift toolchain to build. No package manager, no Electron, no browser runtime. One SwiftUI binary and the system `libsqlite3`.
+
+---
+
+## Why Claude Code sessions disappear after switching accounts
+
+The Claude desktop app stores its session index partitioned by account:
 
 ```
 ~/Library/Application Support/Claude/claude-code-sessions/
-├── <accountUuidA>/<orgUuid>/local_*.json   ← account A: 101 sessions
-└── <accountUuidB>/<orgUuid>/local_*.json   ← account B: 1 session
+├── <accountUuidA>/<orgUuid>/local_*.json     account A
+└── <accountUuidB>/<orgUuid>/local_*.json     account B
 ```
 
-When you switch login, the app reads **only the folder of the account you are signed into**, so every session recorded under the other account vanishes from the sidebar. This is documented and [closed as "not planned"](https://github.com/anthropics/claude-code/issues/48511) — it is the intended behavior, not a bug that will be fixed.
+On launch it reads only the folder belonging to the account you are signed into. Sessions recorded under any other account are still on disk, still complete, and completely invisible in the sidebar. Anthropic has [closed this as "not planned"](https://github.com/anthropics/claude-code/issues/48511), so it is settled behavior rather than a defect waiting for a patch.
 
-The important part: **the conversations themselves are not lost.** The actual transcripts live in a *non*-partitioned location:
+The useful detail is what stays put. Transcripts are written to a location that is not partitioned by account:
 
 ```
-~/.claude/projects/<encoded-path>/<cliSessionId>.jsonl
+~/.claude/projects/<encoded-working-directory>/<sessionId>.jsonl
 ```
 
-That's why the CLI (`claude --resume`) can always see every session regardless of account. Only the small `local_*.json` **index files** — title, sort order, last-opened timestamp, MCP config — are partitioned. So the fix is to reconcile the index across accounts, which is exactly what this tool does.
+That is why `claude --resume` in the terminal always sees everything while the desktop sidebar does not. Only the small `local_*.json` index files carry the account boundary: title, sort order, last opened timestamp, MCP configuration. Reconciling those files across accounts restores the full list, which is what the Accounts tab does.
+
+### What the Accounts tab does
+
+Every account under `claude-code-sessions/` is discovered and listed with its UUID, session count and last activity, with the most recently used one flagged as active. Each session is shown with the accounts that hold a copy, which copy leads, and a status of `in sync`, `diverging` or `missing`.
+
+Sessions whose transcript was already removed by Claude's own cleanup are marked as orphaned. They still appear in the sidebar and still open empty, and no amount of syncing will bring them back. Labelling them keeps the difference between "out of date" and "gone" visible.
+
+Reconciliation picks a winner per session, compared as a tuple of `lastActivityAt`, then `lastFocusedAt`, then file modification time. The tuple matters more than it looks: sessions you reopened without sending a message differ only in `lastFocusedAt`, so a comparison on activity alone would tie and hand the decision to iteration order.
+
+Two fields resist the winner rule on purpose. `remoteMcpServersConfig` and `enabledMcpTools` reference MCP servers registered per account, and Claude empties them when a session is opened under an account that cannot resolve those UUIDs. If the winning copy has them empty while the destination still has them filled, the destination keeps its own values. A naive sync would quietly erase working MCP configuration. Everything else follows the winner, and `scheduled-tasks.json` is never touched at all, since it belongs to the account that scheduled the tasks.
+
+Nothing is written before you open the plan and confirm. The preview lists exactly which sessions will be created or updated and in which direction.
 
 ---
 
-## What it does
+## The Codex bridge
 
-- **Discovers every account** under `claude-code-sessions/` and lists them with their UUID, session count, and last activity. The most-recently-active account is flagged **Active**.
-- **Lists every session** across all accounts, with title, working directory, which accounts it exists in, which copy is the most recent, and a per-session status: `in sync`, `diverging`, or `missing`.
-- **Flags orphaned sessions** — those whose transcript has been removed by Claude's automatic cleanup. They still appear in the sidebar but open empty, and no sync can bring them back. The tool marks them clearly so you know the difference between "out of sync" and "gone".
-- **Previews the sync plan** before touching anything — a list of exactly which sessions will be created or updated, and in which direction.
-- **Backs up and syncs in one click**: deletes previous backups, makes a fresh dated backup of the whole `claude-code-sessions` folder, then writes the winning copy of each session into every account.
+The Codex tab pairs each Claude Code session with a thread in OpenAI Codex, the coding surface inside the ChatGPT desktop app, and keeps both sides current in either direction.
 
-Nothing is written until you open the preview and press **Back up and apply**.
+A Claude session becomes a resumable Codex thread: a rollout JSONL file, a row in the `threads` table of `state_5.sqlite`, an entry in `session_index.jsonl`, and the workspace hints the ChatGPT app reads when you group chats by project. A Codex thread becomes a resumable Claude session: a transcript with a valid uuid chain plus a desktop index entry. Imported threads list and open in the ChatGPT app and resume with `codex exec resume`, and imported sessions appear in the Claude sidebar with their tool calls rendered natively.
 
----
+After the first mirror, syncing is incremental. A byte offset cursor per side records exactly how far each file has been consumed, so only the new region is read, converted and appended. Identifiers are derived deterministically from the source session, which is what makes every operation idempotent: running a sync twice produces the same file, never a duplicate.
 
-## How reconciliation works
+### What crosses, and what cannot
 
-For every session that exists in more than one account, the tool picks a **winner** and copies it to the others.
+| Content | Claude to Codex | Codex to Claude |
+| --- | --- | --- |
+| User and assistant turns | preserved | preserved |
+| Tool calls and results | bounded `[external_agent_tool_call]` tags with the key fields extracted | native `tool_use` and `tool_result` blocks |
+| Plans, scripts, commands | preserved inside the tool tags | preserved inside the tool blocks |
+| Model reasoning | dropped | dropped |
+| Injected control payloads | filtered | filtered |
 
-### Choosing the winner
+The Claude to Codex renderer follows OpenAI's own migration code, from turn identifiers to the closing import marker and token estimate, so imported chats read the way a natively imported chat reads. The reverse direction goes further than the tags: Codex `function_call` and `custom_tool_call` payloads become real Claude tool blocks, which is how MCP tools already render, with every call guaranteed a matching result. Missing outputs are synthesized during a full import, and an incremental sync waits rather than inventing one while a call is still open.
 
-The winner is the copy with the highest `(lastActivityAt, lastFocusedAt, mtime)` tuple, compared in that order.
+Reasoning is the one thing that genuinely does not travel. Codex writes its reasoning to disk encrypted, so nothing local can read it, including OpenAI's own exporter. Claude writes thinking blocks in clear text, but the API does not replay thinking from earlier turns when a session resumes, so carrying it across would preserve text that neither assistant would use. What the model actually acted on does cross: plan updates, commands, edits, and the messages themselves.
 
-It has to be a tuple, not just `lastActivityAt`: some sessions differ **only** in `lastFocusedAt` (you re-opened a session without sending a message). With `lastActivityAt` alone those would tie and the winner would be arbitrary — the tuple breaks the tie deterministically.
+### Forks, branches and duplicate chats
 
-### Preserving per-account MCP config
+Both assistants fork conversations, in different ways, and both used to produce twin chats on the other side.
 
-Two fields — `remoteMcpServersConfig` and `enabledMcpTools` — reference MCP-server UUIDs that are registered **per account**. When you open a session under an account that can't resolve those UUIDs (e.g. a Figma server registered on the other account), the app resets them to empty.
+Codex links continuation threads with `forked_from_id` and `parent_thread_id`, which is what happens when a long task crosses several git branch merges. The ChatGPT interface stitches those segments into one conversation, so the bridge does the same and syncs the whole chain into a single Claude session instead of a pile of fragments.
 
-If the winning copy has these fields empty but the destination copy still has them populated, the tool **keeps the destination's value**. Without this rule a naïve sync would wipe still-valid MCP configuration. Only genuinely account-scoped fields are protected this way; everything else follows the winner.
+Claude forks in the opposite direction. Editing an earlier prompt makes the desktop app write a new transcript file, copying the ancestor lines verbatim with their original uuids and diverging at the edit point, while the previous file keeps the abandoned branch and its `[Request interrupted by user]` marker. Read naively, that new file looks like a brand new session. The engine recognizes the shared root uuid, re-links the existing pair to the fork, computes the divergence point from the uuid chain, and sends only the edited branch into the same Codex thread.
 
-### What is never touched
+When duplicated mirrors already exist from before, the Codex tab detects them and offers consolidation. Divergent turns are merged into the thread that was minted natively, the duplicate thread is archived through the official app server RPC, the dead Claude session leaves the sidebar while its transcript stays on disk, and the ledger folds back to a single pair. Consolidation is only offered where the merge is provably lossless: a hidden session has to be a uuid verified fork ancestor of the one being kept, or an exact prefix of its user turns. Two halves of an account switch relic hold complementary content rather than duplicate content, so they are left alone.
 
-`scheduled-tasks.json` is not a session — it belongs to whichever account scheduled the tasks — and is always skipped.
+### Finishing turns, conflicts, background sync
 
-### Safety
+A session that is still being written shows as `working`, stays out of the menu bar badge, and is skipped by both manual and automatic syncs. That state is read from the file tail rather than from a timer, because a long tool call keeps a transcript silent for minutes while the turn is very much open. An unanswered prompt, a tool call without its result, or an open `task_started` all mean the same thing: wait. Turns left dangling for more than ten minutes are treated as abandoned so a dead session cannot block syncing forever.
 
-- Backups are made **before** any write. Previous `claude-code-sessions.backup-*` folders are deleted and one fresh, complete, timestamped copy is created. The delete step double-checks the path prefix so it can never remove anything outside the backup namespace.
-- Every session file is written **atomically** (`Data.write(options: .atomic)`), so a crash mid-write can never leave a truncated JSON file.
-- If the backup fails for any reason, the sync **aborts before writing** and reports it — your sessions are left untouched.
+If both sides advanced since the last sync, the pair is flagged as a conflict and counted in the badge. Nothing is resolved automatically. You choose the winning side, its new turns are mirrored, and the losing side keeps its own turns in its own transcript, recorded in the ledger as a skipped range rather than deleted.
 
----
-
-## Important notes
-
-- **Quit and reopen the Claude app after syncing.** The index is only re-read on launch, so a running Claude app won't show the changes until you restart it — and may even overwrite the files you just synced. The tool warns you when Claude is open.
-- **Orphaned sessions cannot be recovered.** The tool aligns the index; it cannot recreate a transcript that automatic cleanup already deleted from `~/.claude/projects`. Orphans are marked so you're not surprised when they open empty.
-- **Divergence is one-directional and continuous.** The moment you use a session under one account, that account's copy pulls ahead. Re-run the sync before switching accounts if you want both sides current. There is no automatic background sync — this is a deliberate, on-demand tool.
+Auto sync is opt-in. One FSEvents stream watches both session trees, a per session quiet period (20 seconds by default, adjustable) marks the end of a reply, and the pair syncs itself. Writes made by the engine are suppressed at the watcher so it never reacts to its own output. With the window closed the app keeps running in the background, and the menu bar shows a live count of what is waiting.
 
 ---
 
-## Build
+## Inside the sync engine
 
-Requires the Xcode command-line Swift toolchain (`swiftc`). Apple Silicon.
+```mermaid
+flowchart LR
+    CT["Claude transcripts<br/>~/.claude/projects"]
+    CR["Codex rollouts<br/>~/.codex/sessions"]
+    L["Pair ledger<br/>byte cursors, write intents, fork segments"]
+    CI["Claude session index<br/>claude-code-sessions"]
+    CD["Codex threads<br/>state_5.sqlite"]
+
+    CT -- "new bytes" --> L
+    CR -- "new bytes" --> L
+    L -- "converted turns" --> CR
+    L -- "converted turns" --> CT
+    L -- "index entry" --> CI
+    L -- "thread row" --> CD
+```
+
+The ledger at `~/Library/Application Support/ClaudeSessionSync/codex-links.json` is the only piece of state the app owns. It holds one record per pair: the two identifiers, the two file paths, a cursor per side, the uuid the next appended line should attach to, the deterministic counters that keep conversions reproducible, fork segments, retired ancestors, and any range that a conflict resolution deliberately skipped. It is written atomically through a temporary file, an fsync and a rename, keeping one previous generation as a backup, and every read modify write cycle is serialized by an advisory lock so two processes cannot overwrite each other.
+
+Before any append, the engine records a write intent: target file, offset, length and payload hash, flushed to disk first. If the app is killed mid write, the next launch hashes that byte range and reaches one of three conclusions: the write landed and the carried post state is applied verbatim, the write never started and the intent is dropped, or the result is ambiguous and the pair is held for review rather than guessed at.
+
+Verify runs a read only structural check across every pair: uuid chains on the lines the engine wrote, tool call and result pairing with an allowance for a tail still in flight, rollout identity and turn balance, cursor coherence against real file sizes on disk. Running it after a round trip is the cheapest way to confirm that a chat which crossed both ways is still structurally intact.
+
+---
+
+## Safety model
+
+Writing runs begin with a timestamped backup: the Codex database copied through `VACUUM INTO` with the SQLite online backup API as fallback, the session index, the ledger, and the Claude session index. Three runs are kept and older ones are pruned inside their own namespace with a path prefix check.
+
+Transcripts and rollouts are only ever appended to, never rewritten, each with a one generation `.css-bak` beside it. Appends verify that the file still ends where the intent said it did, so a native writer landing a turn in the same instant cancels the round instead of poisoning a cursor. Index files are written atomically. A schema version guard disables Codex side writes if the ChatGPT app changes its database format, which is a real possibility given that the format is still alpha, and reading keeps working in the meantime.
+
+The app itself makes no network requests. The only process it talks to is the local `codex app-server`, used for archiving threads, because writing `archived = 1` straight into sqlite gets reverted by the ChatGPT app on its next launch.
+
+---
+
+## Build and run
 
 ```sh
+git clone https://github.com/lavderenterprise/claude-sync.git
+cd claude-sync
 ./build.sh
 open ClaudeSessionSync.app
 ```
 
-`build.sh` compiles the two Swift sources into a proper `.app` bundle with an `Info.plist`, then ad-hoc code-signs it (without a signature macOS kills the app on launch on Apple Silicon).
+`build.sh` compiles the icon with `actool`, builds the sources into an app bundle with its `Info.plist`, and applies an ad hoc signature, without which macOS refuses to launch the binary on Apple Silicon.
 
-### Project layout
-
-```
-Sources/App.swift                 Scene, AppDelegate (background lifecycle), TabView shell
-Sources/AppModel.swift            App-scoped root model: watcher wiring, auto-sync coordinator, badge
-Sources/ClaudeSessionSync.swift   Accounts engine — index scan, winner rule, merge, backup, sync
-Sources/UI.swift                  Accounts tab views (stats, cards, table, plan/result sheets)
-Sources/CodexModel.swift          Pair model, states, sync report, user-facing fatal errors
-Sources/LinkStore.swift           Pair ledger: side cursors, write intents, atomic tmp+bak persistence
-Sources/ClaudeStore.swift         Claude side: streaming JSONL parser/writers, turn-in-flight detection
-Sources/CodexStoreIO.swift        Codex side: rollout I/O, threads-DB writers, templates, UI-state top-ups
-Sources/Conversion.swift          Both converters (native-importer-parity + native tool blocks), deterministic IDs
-Sources/SyncEngine.swift          Scan, change detection, executors, conflicts, mass import, doctor, backups
-Sources/SQLiteLite.swift          Zero-dependency SQLite wrapper + live-DB backup (VACUUM INTO / backup API)
-Sources/AppServerRPC.swift        JSON-RPC client for `codex app-server` (durable thread archiving)
-Sources/Watcher.swift             FSEvents stream, quiescence debouncer, self-event suppression gate
-Sources/MenuBar.swift             Menu bar extra: badge label + quick-sync menu
-Sources/CodexStore.swift          Codex tab store (UI state, async operation dispatch)
-Sources/CodexUI.swift             Codex tab views: pair table, plan/resolve/result/verify sheets
-Sources/SettingsUI.swift          Settings tab: auto-sync, quiet period, menu bar, login item
-Icon/AppIcon.icon                 App icon, authored in Apple Icon Composer
-build.sh                          Compiles the icon (actool), bundles, and signs ClaudeSessionSync.app
-```
-
-Engine code never imports SwiftUI views and vice versa: everything that touches disk lives in the store/engine files; the `*UI.swift` files only present it.
-
-### App icon
-
-The icon is authored in **Apple Icon Composer** and lives at `Icon/AppIcon.icon`. At build time `build.sh` runs `actool` — Apple's own asset compiler — to render it into `Assets.car` (the Liquid Glass icon macOS 26 draws natively) plus a flat `AppIcon.icns` fallback for older systems. The icon is never hand-converted; to change it, edit the `.icon` bundle in Icon Composer and rebuild.
+The icon is authored in Apple Icon Composer and lives at `Icon/AppIcon.icon`. At build time `actool`, Apple's own asset compiler, renders it into the `Assets.car` that macOS 26 draws as a Liquid Glass icon, plus a flat `AppIcon.icns` for older systems. It is never hand converted, so changing it means editing the `.icon` bundle and rebuilding.
 
 ---
 
-## Paths it reads
+## Where the data lives
 
-| Path | Purpose |
+Claude Code:
+
+| Path | Role |
 | --- | --- |
-| `~/Library/Application Support/Claude/claude-code-sessions/` | Per-account session index (read + written) |
-| `~/Library/Application Support/Claude/ant-device-registry.json` | Per-account device registration (read only) |
-| `~/.claude/**/*.jsonl` | Transcripts, to detect orphaned sessions (read only) |
-| `~/Library/Application Support/Claude/claude-code-sessions.backup-*` | Backups the tool creates (written) |
+| `~/.claude/projects/<project>/<sessionId>.jsonl` | Transcripts, one JSON object per line, linked by `uuid` and `parentUuid` |
+| `~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_*.json` | Per account session index: title, timestamps, MCP configuration |
 
-The tool never reads or transmits transcript **contents** — it only checks whether a transcript file exists.
+OpenAI Codex:
+
+| Path | Role |
+| --- | --- |
+| `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` | Rollouts: session metadata, events and response items |
+| `~/.codex/archived_sessions/` | Where a rollout moves when its thread is archived |
+| `~/.codex/state_5.sqlite` | `threads` table, the list the ChatGPT app renders |
+| `~/.codex/session_index.jsonl` | Secondary index kept alongside the database |
+
+`CODEX_HOME` is honored the same way the `codex` CLI honors it, so a relocated Codex home is picked up without configuration.
+
+This app:
+
+| Path | Role |
+| --- | --- |
+| `~/Library/Application Support/ClaudeSessionSync/codex-links.json` | Pair ledger |
+| `~/Library/Application Support/ClaudeSessionSync/backups/` | Timestamped backups, last three runs |
+
+---
+
+## Project layout
+
+```
+Sources/App.swift                 Scene, app delegate for background lifecycle, tab shell
+Sources/AppModel.swift            App scoped root model: watcher wiring, auto sync, badge
+Sources/ClaudeSessionSync.swift   Accounts engine: index scan, winner rule, merge, backup, sync
+Sources/UI.swift                  Accounts tab views
+Sources/CodexModel.swift          Pair model, states, sync report, user facing errors
+Sources/LinkStore.swift           Pair ledger: cursors, write intents, atomic persistence, lock
+Sources/ClaudeStore.swift         Claude side: streaming JSONL reader and writers, fork forensics
+Sources/CodexStoreIO.swift        Codex side: rollout I/O, threads table, templates, UI state
+Sources/Conversion.swift          Both converters and the deterministic identifier scheme
+Sources/SyncEngine.swift          Scan, change detection, executors, conflicts, consolidation, doctor
+Sources/SQLiteLite.swift          SQLite wrapper and live database backup
+Sources/AppServerRPC.swift        JSON-RPC client for codex app-server
+Sources/Watcher.swift             FSEvents stream and quiescence debouncer
+Sources/MenuBar.swift             Menu bar extra: badge and quick sync
+Sources/CodexStore.swift          Codex tab store
+Sources/CodexUI.swift             Codex tab views and sheets
+Sources/SettingsUI.swift          Settings: auto sync, quiet period, menu bar, login item
+Icon/AppIcon.icon                 App icon, authored in Apple Icon Composer
+build.sh                          Icon compilation, bundling, signing
+```
+
+Engine code never imports SwiftUI and view code never touches disk. Anything that reads or writes lives in the store and engine files, and the `*UI.swift` files only present what those produce.
+
+---
+
+## Questions worth answering
+
+**Do I need both apps installed?** The Accounts tab only needs Claude. The Codex tab needs `~/.codex` to exist, which means opening Codex in the ChatGPT app at least once.
+
+**Do I have to restart anything after a sync?** Yes, and the app tells you which side. Both desktop apps read their session lists at launch and cache them, so a running app will not show imported chats, and the Claude app can overwrite index files you just reconciled.
+
+**Can a sync lose messages?** The design answer is no: appends only, backups first, write intents around every append, conflicts held for a manual decision, skipped ranges recorded rather than dropped. The honest answer is to run Verify after a round trip, which is exactly what it is for.
+
+**Why does an imported chat contain a marker line?** OpenAI's importer closes a migrated conversation with `<EXTERNAL SESSION IMPORTED>` and a token estimate. Imports here follow the same shape, and those markers are filtered on the way back so they never bounce between the two apps.
+
+**What happens if the ChatGPT app changes its database?** Codex side writes stop and a notice appears, with reading and Claude side syncing unaffected, until the app is updated for the new schema.
+
+**Is anything sent anywhere?** No. Everything happens between local files, and transcript contents never leave the machine.
 
 ---
 
 ## License
 
-MIT — do whatever you want. No warranty; it edits files under `Application Support`, and while it backs up first, you run it at your own risk.
+MIT. It edits files under `Application Support` and inside `~/.claude` and `~/.codex`, and while it backs up before every write, you run it at your own risk.
